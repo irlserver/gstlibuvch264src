@@ -374,12 +374,17 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
 		gst_buffer_fill(buffer, 0, new_frame, new_bytes);
 		
 		free(new_frame);
+
+		if (!self->had_idr)
+			self->had_idr = TRUE;
+
+	} else if (!self->had_idr) {
+		return;
 	}
-	else {
-		buffer = gst_buffer_new_allocate(NULL, frame->data_bytes, NULL);
-		gst_buffer_fill(buffer, 0, frame->data, frame->data_bytes);
-	}
-	
+
+	buffer = gst_buffer_new_allocate(NULL, frame->data_bytes, NULL);
+	gst_buffer_fill(buffer, 0, frame->data, frame->data_bytes);
+
 	// Set timestamps on the buffer
     GstClockTime timestamp = gst_util_uint64_scale(self->frame_count * GST_SECOND, 1, self->framerate);
     GST_BUFFER_PTS(buffer) = timestamp;
