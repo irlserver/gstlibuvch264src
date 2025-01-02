@@ -62,16 +62,29 @@ static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
   gobject_class->finalize = gst_libuvc_h264_src_finalize;
 }
 
-void create_hidden_directory(GstLibuvcH264Src *self) {
-	const char *home_dir = getenv("HOME");
+#define DIRBUFLEN 4096
+__thread char dir_buf[DIRBUFLEN];
+char *get_spspps_path(GstLibuvcH264Src *self, char *index) {
+    const char *home_dir = getenv("HOME");
     if (home_dir == NULL) {
         GST_WARNING_OBJECT(self, "Warning: HOME environment variable not set.");
         home_dir = "";
     }
-	
-    // Construct the path to the hidden directory
-    char hidden_dir[255];
-	sprintf(hidden_dir, "%s/.spspps/", home_dir);
+
+	int ret = snprintf(dir_buf, DIRBUFLEN, "%s/.spspps%s%s",
+	                   home_dir,
+	                   index ? "/" : "",
+	                   index ? index : "");
+	if (ret >= DIRBUFLEN) {
+	    GST_ERROR_OBJECT(self, "Error building SPS/PPS path\n");
+	    return NULL;
+	}
+
+	return dir_buf;
+}
+
+void create_hidden_directory(GstLibuvcH264Src *self) {
+    char *hidden_dir = get_spspps_path(self, NULL);
 
     // Check if the directory exists
     struct stat st;
@@ -86,68 +99,42 @@ void create_hidden_directory(GstLibuvcH264Src *self) {
         GST_WARNING_OBJECT(self, "Warning: %s exists but is not a directory.\n", hidden_dir);
 }
 
-void load_spspps(GstLibuvcH264Src *self) {
-	create_hidden_directory(self);
-	
-	const char *home_dir = getenv("HOME");
-    if (home_dir == NULL) {
-        GST_WARNING_OBJECT(self, "Warning: HOME environment variable not set.");
-        home_dir = "";
+FILE *open_spspps_file(GstLibuvcH264Src *self, char mode) {
+    if (mode == 'w' || mode == 'a') {
+        create_hidden_directory(self);
     }
-	
-	char file_name[255] = { 0 };
-	sprintf(file_name, "%s/.spspps/%s", home_dir, self->index);
-	
-	FILE* fp = fopen(file_name, "rb");
+
+    char m[3];
+    sprintf(m, "%cb", mode);
+    char *file_name = get_spspps_path(self, self->index);
+    FILE *fp = fopen(file_name, m);
+    return fp;
+}
+
+void load_spspps(GstLibuvcH264Src *self) {
+	FILE* fp = open_spspps_file(self, 'r');
 	if (fp) {
 		gint read_bytes = fread(self->spspps, 1, 1024, fp);
 		self->spspps_length = read_bytes;
 		fclose(fp);
 	}
-	else {
-		fp = fopen(file_name, "wb");
-		if (fp) {
-			fwrite(self->spspps, 1, self->spspps_length, fp);
-			fclose(fp);
-		}
-	}
 }
 
 void store_spspps(GstLibuvcH264Src *self, gchar* spspps, gint spspps_length, gint nal_type) {
-	const char *home_dir = getenv("HOME");
-    if (home_dir == NULL) {
-        GST_WARNING_OBJECT(self, "Warning: HOME environment variable not set.");
-        home_dir = "";
+    gint offset = (nal_type == 7) ? 0 : self->spspps_length;
+    if ((offset + self->spspps_length) > (gint)sizeof(self->spspps)) {
+        GST_WARNING_OBJECT(self, "New SPS/PPS NAL unit(s) of length %d is too long to append at offset %d.\n",
+                                 spspps_length, offset);
+        return;
     }
-	
-	char file_name[255] = { 0 };
-	sprintf(file_name, "%s/.spspps/%s", home_dir, self->index);
-	
-	FILE* fp = NULL;
-	
-	if (nal_type == 7)
-		fp = fopen(file_name, "wb");
-	else if (nal_type == 8)
-		fp = fopen(file_name, "ab");
-	
+    memcpy(self->spspps + offset, spspps, spspps_length);
+    self->spspps_length = offset + spspps_length;
+
+    FILE* fp = open_spspps_file(self, 'w');
 	if (fp) {
 		fwrite(spspps, 1, spspps_length, fp);
 		fclose(fp);
 	}
-	
-	// check PPS (integrated sps/pps)
-	if (nal_type == 7) {
-		int i;
-		for (i = 0; i < (spspps_length-4); i++) {
-			if (spspps[i] == 0 && spspps[i + 1] == 0 && spspps[i + 2] == 0 && spspps[i + 3] == 1 && (spspps[i + 4] & 0x1F) == 8) {
-				nal_type = 8;
-				break;
-			}
-		}
-	}
-	
-	if (nal_type == 8)
-		load_spspps(self);
 }
 
 static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
