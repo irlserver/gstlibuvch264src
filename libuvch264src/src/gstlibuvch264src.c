@@ -362,23 +362,21 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
 	// Parse SPS/PPS
 	if (nal_type == 7 || nal_type == 8)
 		store_spspps(self, frame->data, frame->data_bytes, nal_type);
-	
-	GstBuffer *buffer = NULL;
-	if (nal_type == 5) {
-		gint new_bytes = frame->data_bytes + self->spspps_length;
-		buffer = gst_buffer_new_allocate(NULL, new_bytes, NULL);
-		gst_buffer_fill(buffer, 0, self->spspps, self->spspps_length);
-		gst_buffer_fill(buffer, self->spspps_length, frame->data, frame->data_bytes);
 
+	// Don't pass on frames received before the first IDR frame
+	if (!self->had_idr && nal_type != 5) return;
+
+	gint buf_offset = (nal_type == 5) ? self->spspps_length : 0;
+	gint buf_size = frame->data_bytes + buf_offset;
+	GstBuffer *buffer = gst_buffer_new_allocate(NULL, buf_size, NULL);
+	gst_buffer_fill(buffer, buf_offset, frame->data, frame->data_bytes);
+
+	if (nal_type == 5) {
+		// For IDR frames, prepend the cached SPS/PPS
+		gst_buffer_fill(buffer, 0, self->spspps, self->spspps_length);
 		if (!self->had_idr)
 			self->had_idr = TRUE;
-
-	} else if (!self->had_idr) {
-		return;
 	}
-
-	buffer = gst_buffer_new_allocate(NULL, frame->data_bytes, NULL);
-	gst_buffer_fill(buffer, 0, frame->data, frame->data_bytes);
 
 	// Set timestamps on the buffer
     GstClockTime timestamp = gst_util_uint64_scale(self->frame_count * GST_SECOND, 1, self->framerate);
