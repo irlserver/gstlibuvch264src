@@ -19,6 +19,8 @@ G_DECLARE_FINAL_TYPE(GstLibuvcH264Src, gst_libuvc_h264_src, GST, LIBUVC_H264_SRC
 #define DJI_VENDOR_ID 0x2ca3
 #define DJI_PRODUCT_ID 0x0023
 
+#define SPSPPSBUFSZ 1024
+
 struct _GstLibuvcH264Src {
   GstPushSrc parent_instance;
   gchar* index;
@@ -33,8 +35,10 @@ struct _GstLibuvcH264Src {
   gint framerate;
   gint frame_count;
   gboolean had_idr;
-  unsigned char spspps[1024];
-  gint spspps_length;
+  gint sps_length;
+  gint pps_length;
+  unsigned char sps[SPSPPSBUFSZ];
+  unsigned char pps[SPSPPSBUFSZ];
 };
 
 G_END_DECLS

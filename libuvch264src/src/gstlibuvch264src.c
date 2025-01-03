@@ -7,6 +7,12 @@
 GST_DEBUG_CATEGORY_STATIC(gst_libuvc_h264_src_debug);
 #define GST_CAT_DEFAULT gst_libuvc_h264_src_debug
 
+typedef struct {
+    int type;
+    unsigned char *ptr;
+    int len;
+} nal_unit_t;
+
 enum {
   PROP_0,
   PROP_INDEX,
@@ -111,28 +117,71 @@ FILE *open_spspps_file(GstLibuvcH264Src *self, char mode) {
     return fp;
 }
 
-void load_spspps(GstLibuvcH264Src *self) {
-	FILE* fp = open_spspps_file(self, 'r');
-	if (fp) {
-		gint read_bytes = fread(self->spspps, 1, 1024, fp);
-		self->spspps_length = read_bytes;
-		fclose(fp);
-	}
+int find_nal_unit(unsigned char *buf, int buflen, int start, int search, int *offset) {
+    if (buflen < (start + 5)) return -1;
+
+    int i = start;
+    do {
+        if (buf[i] == 0 && buf[i+1] == 0 && buf[i+2] == 0 && buf[i+3] == 1) {
+            if (offset) *offset = i;
+            return (buf[i+4] & 0x1F);
+        }
+        i++;
+    } while (search && i < (buflen - 4));
+
+    return -1;
 }
 
-void store_spspps(GstLibuvcH264Src *self, gchar* spspps, gint spspps_length, gint nal_type) {
-    gint offset = (nal_type == 7) ? 0 : self->spspps_length;
-    if ((offset + self->spspps_length) > (gint)sizeof(self->spspps)) {
-        GST_WARNING_OBJECT(self, "New SPS/PPS NAL unit(s) of length %d is too long to append at offset %d.\n",
-                                 spspps_length, offset);
-        return;
-    }
-    memcpy(self->spspps + offset, spspps, spspps_length);
-    self->spspps_length = offset + spspps_length;
+int parse_nal_units(nal_unit_t *units, int max, unsigned char *buf, int buflen) {
+    int i = 0;
 
+    int nal_offset = 0;
+    int next_type = find_nal_unit(buf, buflen, 0, 0, &nal_offset);
+    while (next_type >= 0 && i < max) {
+        int type = next_type;
+        int start = nal_offset;
+        next_type = find_nal_unit(buf, buflen, nal_offset + 5, 1, &nal_offset);
+        int end = (next_type >= 0) ? nal_offset : buflen;
+        int length = end - start;
+
+        units[i].type = type;
+        units[i].len = length;
+        units[i].ptr = &buf[start];
+
+        i++;
+    }
+
+    return i;
+}
+
+void load_spspps(GstLibuvcH264Src *self) {
+    FILE* fp = open_spspps_file(self, 'r');
+    if (fp) {
+        unsigned char buf[SPSPPSBUFSZ*2];
+        gint read_bytes = fread(buf, 1, sizeof(buf), fp);
+        fclose(fp);
+
+        #define MAX_UNITS_LOAD 2
+        nal_unit_t units[MAX_UNITS_LOAD];
+        int c = parse_nal_units(units, MAX_UNITS_LOAD, buf, read_bytes);
+
+        for (int i = 0; i < c; i++) {
+            if (units[i].type == 7) {
+                memcpy(self->sps, units[i].ptr, units[i].len);
+                self->sps_length = units[i].len;
+            } else if (units[i].type == 8) {
+                memcpy(self->pps, units[i].ptr, units[i].len);
+                self->pps_length = units[i].len;
+            }
+        }
+    }
+}
+
+void store_spspps(GstLibuvcH264Src *self) {
     FILE* fp = open_spspps_file(self, 'w');
 	if (fp) {
-		fwrite(spspps, 1, spspps_length, fp);
+		fwrite(self->sps, 1, self->sps_length, fp);
+		fwrite(self->pps, 1, self->pps_length, fp);
 		fclose(fp);
 	}
 }
@@ -148,11 +197,16 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->height = DEFAULT_HEIGHT;
   self->framerate = DEFAULT_FRAMERATE;
   self->frame_count = 0; // Added to track frames for timestamping
+
   // Initialization, not fixed
-  self->spspps_length = 39;
-  gchar spspps[] = { 0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x34, 0xAC, 0x4D, 0x00, 0xA0, 0x0B, 0x74, 0xD4, 0x04, 0x04, 0x05, 0x00, 0x00, 0x03, 0x03, 0xE8, 0x00, 0x00, 0xEA, 0x60, 0x0F, 0x1C, 0x32, 0xA0, 0x00, 0x00, 0x00, 0x01, 0x68, 0xEE, 0x3C, 0xB0 };
-  memcpy(self->spspps, spspps, self->spspps_length);
-  
+  gchar sps[] = { 0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x34, 0xAC, 0x4D, 0x00, 0xA0, 0x0B, 0x74, 0xD4, 0x04, 0x04, 0x05, 0x00, 0x00, 0x03, 0x03, 0xE8, 0x00, 0x00, 0xEA, 0x60, 0x0F, 0x1C, 0x32, 0xA0 };
+  self->sps_length = sizeof(sps);
+  memcpy(self->sps, sps, self->sps_length);
+
+  gchar pps[] = { 0x00, 0x00, 0x00, 0x01, 0x68, 0xEE, 0x3C, 0xB0 };
+  self->pps_length = sizeof(pps);
+  memcpy(self->pps, pps, self->pps_length);
+
   gst_base_src_set_live(GST_BASE_SRC(self), TRUE);
   gst_base_src_set_format(GST_BASE_SRC(self), GST_FORMAT_TIME);
 }
@@ -334,47 +388,67 @@ static gboolean gst_libuvc_h264_src_stop(GstBaseSrc *src) {
 void frame_callback(uvc_frame_t *frame, void *ptr) {
     GstLibuvcH264Src *self = (GstLibuvcH264Src *)ptr;
 
-    if (!frame || !frame->data || frame->data_bytes < 5) {
+    if (!frame || !frame->data || frame->data_bytes <= 0) {
         GST_WARNING_OBJECT(self, "Empty or invalid frame received.");
         return;
     }
 	
 	unsigned char* data = frame->data;
-	if (data[0] != 0 || data[1] != 0 || data[2] != 0 || data[3] != 1) {
-	    GST_WARNING_OBJECT(self, "Invalid frame received.");
-        return;
-	}
-	int nal_type = (data[4] & 0x1F);
-	
-	// Parse SPS/PPS
-	if (nal_type == 7 || nal_type == 8)
-		store_spspps(self, frame->data, frame->data_bytes, nal_type);
+    gboolean updated_sps_pps = FALSE;
 
-	// Don't pass on frames received before the first IDR frame
-	if (!self->had_idr && nal_type != 5) return;
+    #define MAX_UNITS_MAIN 10
+    nal_unit_t units[MAX_UNITS_MAIN];
+    int c = parse_nal_units(units, MAX_UNITS_MAIN, data, frame->data_bytes);
 
-	gint buf_offset = (nal_type == 5) ? self->spspps_length : 0;
-	gint buf_size = frame->data_bytes + buf_offset;
-	GstBuffer *buffer = gst_buffer_new_allocate(NULL, buf_size, NULL);
-	gst_buffer_fill(buffer, buf_offset, frame->data, frame->data_bytes);
+    for (int i = 0; i < c; i++) {
+        nal_unit_t *unit = &units[i];
 
-	if (nal_type == 5) {
-		// For IDR frames, prepend the cached SPS/PPS
-		gst_buffer_fill(buffer, 0, self->spspps, self->spspps_length);
-		if (!self->had_idr)
-			self->had_idr = TRUE;
-	}
+        switch (unit->type) {
+            case 7:
+                self->sps_length = unit->len;
+                memcpy(self->sps, unit->ptr, self->sps_length);
+                updated_sps_pps = TRUE;
+                break;
+            case 8:
+                self->pps_length = unit->len;
+                memcpy(self->pps, unit->ptr, self->pps_length);
+                updated_sps_pps = TRUE;
+                break;
+            case 5: {
+                if (!self->had_idr) {
+                    self->had_idr = TRUE;
 
-	// Set timestamps on the buffer
-    GstClockTime timestamp = gst_util_uint64_scale(self->frame_count * GST_SECOND, 1, self->framerate);
-    GST_BUFFER_PTS(buffer) = timestamp;
-    GST_BUFFER_DTS(buffer) = timestamp;
-    GST_BUFFER_DURATION(buffer) = gst_util_uint64_scale(1, GST_SECOND, self->framerate);
+                    GstBuffer *buffer = gst_buffer_new_allocate(NULL, self->sps_length + self->pps_length, NULL);
+                    gst_buffer_fill(buffer, 0, self->sps, self->sps_length);
+                    gst_buffer_fill(buffer, self->sps_length, self->pps, self->pps_length);
+                    g_async_queue_push(self->frame_queue, buffer);
+                }
+                break;
+            }
+            default:
+                if (!self->had_idr) {
+                    continue;
+                }
+        } // switch
 
-    self->frame_count++;
+        GstBuffer *buffer = gst_buffer_new_allocate(NULL, unit->len, NULL);
+        gst_buffer_fill(buffer, 0, unit->ptr, unit->len);
 
-	// Push the buffer onto the queue
-    g_async_queue_push(self->frame_queue, buffer);
+        // Set timestamps on the buffer
+        if (units[i].type == 1 || units[i].type == 5) {
+            GstClockTime timestamp = gst_util_uint64_scale(self->frame_count * GST_SECOND, 1, self->framerate);
+            GST_BUFFER_PTS(buffer) = timestamp;
+            GST_BUFFER_DTS(buffer) = timestamp;
+            GST_BUFFER_DURATION(buffer) = gst_util_uint64_scale(1, GST_SECOND, self->framerate);
+            self->frame_count++;
+        }
+
+        g_async_queue_push(self->frame_queue, buffer);
+    } // for
+
+    if (updated_sps_pps) {
+        store_spspps(self);
+    }
 }
 
 static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf) {
