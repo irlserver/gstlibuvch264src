@@ -31,7 +31,7 @@ static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE(
 G_DEFINE_TYPE_WITH_CODE(GstLibuvcH264Src, gst_libuvc_h264_src, GST_TYPE_PUSH_SRC,
   GST_DEBUG_CATEGORY_INIT(gst_libuvc_h264_src_debug, "libuvch264src", 0, "libuvch264src element"));
 
-static gboolean gst_libuvc_h264_src_set_caps(GstBaseSrc *basesrc, GstCaps *caps);
+static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc);
 static void gst_libuvc_h264_src_set_property(GObject *object, guint prop_id,
                                              const GValue *value, GParamSpec *pspec);
 static void gst_libuvc_h264_src_get_property(GObject *object, guint prop_id,
@@ -47,7 +47,7 @@ static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
   GstBaseSrcClass *base_src_class = GST_BASE_SRC_CLASS(klass);
   GstPushSrcClass *push_src_class = GST_PUSH_SRC_CLASS(klass);
 
-  base_src_class->set_caps = GST_DEBUG_FUNCPTR(gst_libuvc_h264_src_set_caps);
+  base_src_class->negotiate = GST_DEBUG_FUNCPTR(gst_libuvc_h264_negotiate);
   gobject_class->set_property = gst_libuvc_h264_src_set_property;
   gobject_class->get_property = gst_libuvc_h264_src_get_property;
 
@@ -193,9 +193,7 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->uvc_devh = NULL;
   self->frame_queue = g_async_queue_new();
   self->streaming = FALSE;
-  self->width = DEFAULT_WIDTH;
-  self->height = DEFAULT_HEIGHT;
-  self->framerate = DEFAULT_FRAMERATE;
+  self->framerate = -1;
   self->frame_count = 0; // Added to track frames for timestamping
 
   // Initialization, not fixed
@@ -211,25 +209,125 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   gst_base_src_set_format(GST_BASE_SRC(self), GST_FORMAT_TIME);
 }
 
-static gboolean gst_libuvc_h264_src_set_caps(GstBaseSrc *basesrc, GstCaps *caps) {
+static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
     GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(basesrc);
-    GstStructure *structure = gst_caps_get_structure(caps, 0);
 
-    if (gst_structure_has_name(structure, "video/x-h264")) {
-        gint width, height, framerate_num, framerate_den;
+    GstCaps *thiscaps = gst_pad_query_caps(GST_BASE_SRC_PAD(basesrc), NULL);
+    GST_INFO_OBJECT(basesrc, "caps of src: %" GST_PTR_FORMAT, thiscaps);
 
-        if (gst_structure_get_int(structure, "width", &width))
-            self->width = width;
-        if (gst_structure_get_int(structure, "height", &height))
-            self->height = height;
-        if (gst_structure_get_fraction(structure, "framerate", &framerate_num, &framerate_den) && framerate_den != 0)
-            self->framerate = framerate_num / framerate_den;
+    GstCaps *peercaps = gst_pad_peer_query_caps(GST_BASE_SRC_PAD(basesrc), NULL);
+    GST_INFO_OBJECT(basesrc, "caps of peer: %" GST_PTR_FORMAT, peercaps);
 
-        GST_INFO("Set caps: width=%d, height=%d, framerate=%d", self->width, self->height, self->framerate);
+    GstCaps *caps = NULL;
+    if (peercaps) {
+        caps = gst_caps_intersect(peercaps, thiscaps);
+        gst_caps_unref(thiscaps);
+        gst_caps_unref(peercaps);
     } else {
-        GST_ERROR("Unsupported caps: %s", gst_structure_get_name(structure));
+        caps = thiscaps;
+    }
+
+    GST_INFO_OBJECT(basesrc, "caps intersection: %" GST_PTR_FORMAT, caps);
+
+    gint width = -1, height = -1, framerate = -1;
+    GstCaps *best_caps = NULL;
+
+    GstCaps *tmp_caps = gst_caps_new_simple("video/x-h264",
+                                            "stream-format", G_TYPE_STRING, "byte-stream",
+                                            "alignment", G_TYPE_STRING, "au",
+                                            NULL
+                                           );
+    GstStructure *tmp_structure = gst_caps_get_structure(tmp_caps, 0);
+
+    // Enumerate supported H264 resolutions and framerates
+    // And select the highest compatible resolution, at the highest supported framerate
+    for (const uvc_format_desc_t *format_desc = uvc_get_format_descs(self->uvc_devh);
+         format_desc; format_desc = format_desc->next)
+    {
+        gboolean is_h264 = (memcmp(format_desc->fourccFormat, "H264", 4) == 0);
+        if (!is_h264) continue;
+
+        for (const uvc_frame_desc_t *frame_desc = format_desc->frame_descs;
+             frame_desc; frame_desc = frame_desc->next)
+        {
+            gint resolution = frame_desc->wWidth * frame_desc->wHeight;
+
+            gst_structure_set(tmp_structure,
+                              "width", G_TYPE_INT, frame_desc->wWidth,
+                              "height", G_TYPE_INT, frame_desc->wHeight,
+                              NULL);
+
+            // This holds the highest framerate for the current resolution
+            gint fps = -1;
+            if (frame_desc->intervals) {
+                GValue framerates = G_VALUE_INIT;
+                gst_value_list_init(&framerates, 1);
+
+                for (const uint32_t *interval = frame_desc->intervals; *interval; interval++) {
+                    gint _fps = 1e7 / *interval;
+                    if (_fps > fps) {
+                        fps = _fps;
+                    }
+
+                    GValue fps = G_VALUE_INIT;
+                    g_value_init(&fps, GST_TYPE_FRACTION);
+                    gst_value_set_fraction(&fps, (gint)_fps, 1);
+                    gst_value_list_append_value(&framerates, &fps);
+                }
+
+                gst_structure_set_value(tmp_structure, "framerate", &framerates);
+            } else {
+                gint fps_min = 1e7 / frame_desc->dwMaxFrameInterval;
+                gint fps = 1e7 / frame_desc->dwMinFrameInterval;
+                gst_structure_set(tmp_structure, "framerate", GST_TYPE_FRACTION_RANGE, fps_min, 1, fps, 1, NULL);
+            }
+
+            GST_INFO_OBJECT(basesrc, "Testing hw caps: %" GST_PTR_FORMAT "...", tmp_caps);
+
+            if (gst_caps_can_intersect(caps, tmp_caps)) {
+                GST_INFO_OBJECT(basesrc, "  caps valid");
+
+                if (resolution > (width * height)
+                    || (resolution == (width * height) && fps > framerate)) {
+                    width = frame_desc->wWidth;
+                    height = frame_desc->wHeight;
+
+                    if (best_caps) {
+                        gst_caps_unref(best_caps);
+                    }
+                    best_caps = gst_caps_intersect(caps, tmp_caps);
+                    GstStructure *s = gst_caps_get_structure(best_caps, 0);
+                    gst_structure_fixate_field_nearest_fraction(s, "framerate", fps, 1);
+
+                    gint fr_num, fr_den;
+                    gst_structure_get_fraction(s, "framerate", &fr_num, &fr_den);
+                    framerate = fr_num / fr_den;
+                }
+            } else {
+                GST_INFO_OBJECT(basesrc, "  caps invalid");
+            }
+
+        } // for frame_desc
+    } // for format_desc
+
+    gst_caps_unref(tmp_caps);
+
+    if (width < 0 || height < 0 || framerate < 0 || !best_caps) {
+        GST_ERROR_OBJECT(self, "Unable to negotiate common caps\n");
         return FALSE;
     }
+
+    int res = uvc_get_stream_ctrl_format_size(self->uvc_devh, &self->uvc_ctrl,
+                                              UVC_FRAME_FORMAT_H264, width, height, framerate);
+    if (res < 0) {
+        GST_ERROR_OBJECT(self, "Unable to get stream control: %s", uvc_strerror(res));
+        return FALSE;
+    }
+
+    self->framerate = framerate;
+    gst_base_src_set_caps(basesrc, best_caps);
+
+    GST_INFO_OBJECT(basesrc, "Negotiated caps: %" GST_PTR_FORMAT, best_caps);
 
     return TRUE;
 }
@@ -304,44 +402,7 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
     uvc_exit(self->uvc_ctx);
     return FALSE;
   }
-  
-  // Enumerate and log supported formats and frame sizes
-  const uvc_format_desc_t *format_desc = uvc_get_format_descs(self->uvc_devh);
-  while (format_desc) {
-      GST_INFO("Found format: %s", format_desc->guidFormat);
-      const uvc_frame_desc_t *frame_desc = format_desc->frame_descs;
-      while (frame_desc) {
-          GST_INFO("  Frame size: %ux%u", frame_desc->wWidth, frame_desc->wHeight);
-		  if (frame_desc->intervals) {
-            const uint32_t *interval = frame_desc->intervals;
-            while (*interval) {
-                double fps = 1.0 / (*interval * 1e-7);
-                GST_INFO("    Frame rate: %.2f fps", fps);
-                interval++;
-            }
-		  }
-		  else {
-			GST_INFO("    Frame rate range: %.2f - %.2f fps",
-					 1.0 / (frame_desc->dwMaxFrameInterval * 1e-7),
-					 1.0 / (frame_desc->dwMinFrameInterval * 1e-7));
-		  }
-		  
-          frame_desc = frame_desc->next;
-      }
-	  
-      format_desc = format_desc->next;
-  }
 
-  res = uvc_get_stream_ctrl_format_size(self->uvc_devh, &self->uvc_ctrl,
-                                        UVC_FRAME_FORMAT_H264, self->width, self->height, self->framerate);
-  if (res < 0) {
-    GST_ERROR_OBJECT(self, "Unable to get stream control: %s", uvc_strerror(res));
-    uvc_close(self->uvc_devh);
-    uvc_unref_device(self->uvc_dev);
-    uvc_exit(self->uvc_ctx);
-    return FALSE;
-  }
-  
   load_spspps(self);
 
   return TRUE;
