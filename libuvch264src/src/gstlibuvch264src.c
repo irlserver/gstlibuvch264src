@@ -261,7 +261,7 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
             gint fps = -1;
             if (frame_desc->intervals) {
                 GValue framerates = G_VALUE_INIT;
-                gst_value_list_init(&framerates, 1);
+                g_value_init(&framerates, GST_TYPE_LIST);
 
                 for (const uint32_t *interval = frame_desc->intervals; *interval; interval++) {
                     gint _fps = 1e7 / *interval;
