@@ -31,7 +31,7 @@ RUN make install
 WORKDIR /app
 RUN mkdir build
 WORKDIR /app/build
-RUN meson setup ../libuvch264src/
+RUN meson setup ../gstlibuvch264src/
 RUN meson compile
 RUN meson install --no-rebuild
 
