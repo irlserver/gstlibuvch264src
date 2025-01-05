@@ -1,4 +1,4 @@
-# Use a base image with necessary build tools and GStreamer dependencies for ARM64
+# Use a ARM64 base image
 FROM --platform=linux/arm64 ubuntu:latest AS build
 
 # Set the working directory inside the container
@@ -17,9 +17,8 @@ RUN apt-get update && apt-get install -y \
 	libusb-1.0-0 \
 	libusb-1.0-0-dev
 
-# Clone the necessary repositories (assuming libuvch264src depends on libuvc)
-RUN git clone https://github.com/libuvc/libuvc.git
-RUN git clone https://github.com/irlserver/gstlibuvch264src.git
+# Clone the necessary repositories
+RUN git clone https://github.com/irlserver/gstlibuvch264src.git .
 
 # Build and install libuvc
 WORKDIR /app/libuvc
@@ -30,8 +29,8 @@ RUN make install
 # Build and install libuvch264src
 WORKDIR /app
 RUN mkdir build
+RUN meson setup build ./libuvch264src/
 WORKDIR /app/build
-RUN meson setup ../gstlibuvch264src/
 RUN meson compile
 RUN meson install --no-rebuild
 
