@@ -28,7 +28,7 @@ struct _GstLibuvcH264Src {
   GAsyncQueue *frame_queue;
   gboolean streaming;
   gint framerate;
-  gint frame_count;
+  GstClockTime uvc_start_time;
   gboolean had_idr;
   gint sps_length;
   gint pps_length;
