@@ -194,7 +194,7 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->frame_queue = g_async_queue_new();
   self->streaming = FALSE;
   self->framerate = -1;
-  self->frame_count = 0; // Added to track frames for timestamping
+  self->uvc_start_time = 0;
 
   // Initialization, not fixed
   gchar sps[] = { 0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x34, 0xAC, 0x4D, 0x00, 0xF0, 0x04, 0x4F, 0xCB, 0x35, 0x01, 0x01, 0x01, 0x40, 0x00, 0x00, 0xFA, 0x00, 0x00, 0x3A, 0x98, 0x03, 0xC7, 0x0C, 0xA8 };
@@ -450,6 +450,13 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
     nal_unit_t units[MAX_UNITS_MAIN];
     int c = parse_nal_units(units, MAX_UNITS_MAIN, data, frame->data_bytes);
 
+    GstClockTime timestamp = ((uint64_t)frame->capture_time_finished.tv_sec) * 1000L * 1000L * 1000L
+                             + frame->capture_time_finished.tv_nsec;
+    if (self->uvc_start_time == 0) {
+        self->uvc_start_time = timestamp;
+    }
+    timestamp -= self->uvc_start_time;
+
     for (int i = 0; i < c; i++) {
         nal_unit_t *unit = &units[i];
 
@@ -486,11 +493,9 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
 
         // Set timestamps on the buffer
         if (units[i].type == 1 || units[i].type == 5) {
-            GstClockTime timestamp = gst_util_uint64_scale(self->frame_count * GST_SECOND, 1, self->framerate);
             GST_BUFFER_PTS(buffer) = timestamp;
             GST_BUFFER_DTS(buffer) = timestamp;
             GST_BUFFER_DURATION(buffer) = gst_util_uint64_scale(1, GST_SECOND, self->framerate);
-            self->frame_count++;
         }
 
         g_async_queue_push(self->frame_queue, buffer);
@@ -513,7 +518,7 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
       return GST_FLOW_ERROR;
     }
     self->streaming = TRUE;
-	self->frame_count = 0; // Initialize frame count for timestamping
+	self->uvc_start_time = 0;
   }
 
   // Retrieve a buffer from the queue
