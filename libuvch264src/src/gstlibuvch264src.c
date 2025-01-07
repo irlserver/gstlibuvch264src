@@ -193,8 +193,8 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->uvc_devh = NULL;
   self->frame_queue = g_async_queue_new();
   self->streaming = FALSE;
-  self->framerate = -1;
-  self->uvc_start_time = 0;
+  self->uvc_start_time = G_MAXUINT64;
+  self->prev_pts = G_MAXUINT64;
 
   // Initialization, not fixed
   gchar sps[] = { 0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x34, 0xAC, 0x4D, 0x00, 0xF0, 0x04, 0x4F, 0xCB, 0x35, 0x01, 0x01, 0x01, 0x40, 0x00, 0x00, 0xFA, 0x00, 0x00, 0x3A, 0x98, 0x03, 0xC7, 0x0C, 0xA8 };
@@ -324,7 +324,8 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
         return FALSE;
     }
 
-    self->framerate = framerate;
+    self->frame_interval = (1000L * 1000L * 1000L) / framerate;
+
     gst_base_src_set_caps(basesrc, best_caps);
 
     GST_INFO_OBJECT(basesrc, "Negotiated caps: %" GST_PTR_FORMAT, best_caps);
@@ -450,12 +451,12 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
     nal_unit_t units[MAX_UNITS_MAIN];
     int c = parse_nal_units(units, MAX_UNITS_MAIN, data, frame->data_bytes);
 
-    GstClockTime timestamp = ((uint64_t)frame->capture_time_finished.tv_sec) * 1000L * 1000L * 1000L
+    GstClockTime libuvc_ts = ((uint64_t)frame->capture_time_finished.tv_sec) * 1000L * 1000L * 1000L
                              + frame->capture_time_finished.tv_nsec;
-    if (self->uvc_start_time == 0) {
-        self->uvc_start_time = timestamp;
+    if (self->uvc_start_time == G_MAXUINT64) {
+        self->uvc_start_time = libuvc_ts;
     }
-    timestamp -= self->uvc_start_time;
+    libuvc_ts -= self->uvc_start_time;
 
     for (int i = 0; i < c; i++) {
         nal_unit_t *unit = &units[i];
@@ -493,9 +494,47 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
 
         // Set timestamps on the buffer
         if (units[i].type == 1 || units[i].type == 5) {
+            /* The problems:
+               * libuvc capture timestamps are jittery
+               * video players skip and duplicate frames if the PTSes are noisy
+               * the actual framerate is never precisely equal to the nominal value,
+                 and can drift over time
+            */
+
+            /* We skipped the initial non-IDR frames, so we need to add their
+               duration to the output PTS when we get the first IDR frame */
+            if (self->prev_pts == G_MAXUINT64) {
+                self->prev_pts = libuvc_ts - self->frame_interval;
+            }
+
+            /* Use the difference beween current and previous libuvc
+               timestamps to update the rolling average frame interval */
+            #define AVG_DIV 1000
+            #define AVG_MULT 1
+            #define AVG_ROUNDING (AVG_DIV/2)
+
+            int64_t diff = libuvc_ts - self->prev_uvc_ts;
+            diff = CLAMP(diff, 0, self->frame_interval*2);
+            self->frame_interval = ((self->frame_interval + AVG_ROUNDING) / AVG_DIV * (AVG_DIV - AVG_MULT)) +
+                                   ((diff + AVG_ROUNDING) / AVG_DIV * AVG_MULT);
+            self->prev_uvc_ts = libuvc_ts;
+
+            /* Determine if we need to slightly speed up or slow down the PTSes
+               to track the average libuvc timestamps */
+            GstClockTime timestamp = self->prev_pts + self->frame_interval;
+            diff = libuvc_ts - timestamp;
+            int64_t adj = 0;
+            if (diff > self->frame_interval || diff < -self->frame_interval) {
+                adj = diff / 100;
+                adj = CLAMP(diff, -self->frame_interval / 10, self->frame_interval / 10);
+            }
+            timestamp += adj;
+
             GST_BUFFER_PTS(buffer) = timestamp;
             GST_BUFFER_DTS(buffer) = timestamp;
-            GST_BUFFER_DURATION(buffer) = gst_util_uint64_scale(1, GST_SECOND, self->framerate);
+            GST_BUFFER_DURATION(buffer) = timestamp - self->prev_pts;
+
+            self->prev_pts = timestamp;
         }
 
         g_async_queue_push(self->frame_queue, buffer);
@@ -518,7 +557,8 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
       return GST_FLOW_ERROR;
     }
     self->streaming = TRUE;
-	self->uvc_start_time = 0;
+	self->uvc_start_time = G_MAXUINT64;
+	self->prev_pts = G_MAXUINT64;
   }
 
   // Retrieve a buffer from the queue
