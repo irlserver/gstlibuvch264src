@@ -32,6 +32,7 @@ struct _GstLibuvcH264Src {
   GstClockTime prev_pts;
   gint64 frame_interval; // in ns
   gboolean had_idr;
+  gboolean send_sps_pps;
   gint sps_length;
   gint pps_length;
   unsigned char sps[SPSPPSBUFSZ];

@@ -468,19 +468,26 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
                 self->sps_length = unit->len;
                 memcpy(self->sps, unit->ptr, self->sps_length);
                 updated_sps_pps = TRUE;
-                break;
+                self->send_sps_pps = TRUE;
+                // deliberately not sending SPS/PPS info in their own buffer
+                continue;
             case 8:
                 self->pps_length = unit->len;
                 memcpy(self->pps, unit->ptr, self->pps_length);
                 updated_sps_pps = TRUE;
-                break;
+                self->send_sps_pps = TRUE;
+                // deliberately not sending SPS/PPS info in their own buffer
+                continue;
             case 5: {
-                if (!self->had_idr) {
-                    self->had_idr = TRUE;
+                if (!self->had_idr || self->send_sps_pps) {
                     buffer_offset = self->sps_length + self->pps_length;
                     buffer = gst_buffer_new_allocate(NULL, buffer_offset + unit->len, NULL);
                     gst_buffer_fill(buffer, 0, self->sps, self->sps_length);
                     gst_buffer_fill(buffer, self->sps_length, self->pps, self->pps_length);
+                    self->send_sps_pps = FALSE;
+                }
+                if (!self->had_idr) {
+                    self->had_idr = TRUE;
                 }
                 break;
             }
