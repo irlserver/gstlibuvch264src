@@ -460,6 +460,8 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
 
     for (int i = 0; i < c; i++) {
         nal_unit_t *unit = &units[i];
+        GstBuffer *buffer = NULL;
+        gsize buffer_offset = 0;
 
         switch (unit->type) {
             case 7:
@@ -475,11 +477,10 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
             case 5: {
                 if (!self->had_idr) {
                     self->had_idr = TRUE;
-
-                    GstBuffer *buffer = gst_buffer_new_allocate(NULL, self->sps_length + self->pps_length, NULL);
+                    buffer_offset = self->sps_length + self->pps_length;
+                    buffer = gst_buffer_new_allocate(NULL, buffer_offset + unit->len, NULL);
                     gst_buffer_fill(buffer, 0, self->sps, self->sps_length);
                     gst_buffer_fill(buffer, self->sps_length, self->pps, self->pps_length);
-                    g_async_queue_push(self->frame_queue, buffer);
                 }
                 break;
             }
@@ -489,8 +490,10 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
                 }
         } // switch
 
-        GstBuffer *buffer = gst_buffer_new_allocate(NULL, unit->len, NULL);
-        gst_buffer_fill(buffer, 0, unit->ptr, unit->len);
+        if (!buffer) {
+          buffer = gst_buffer_new_allocate(NULL, unit->len, NULL);
+        }
+        gst_buffer_fill(buffer, buffer_offset, unit->ptr, unit->len);
 
         // Set timestamps on the buffer
         if (units[i].type == 1 || units[i].type == 5) {
