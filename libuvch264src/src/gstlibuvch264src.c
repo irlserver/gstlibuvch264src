@@ -517,28 +517,39 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
                 self->prev_pts = libuvc_ts - self->frame_interval;
             }
 
-            /* Use the difference beween current and previous libuvc
-               timestamps to update the rolling average frame interval */
-            #define AVG_DIV 1000
-            #define AVG_MULT 1
-            #define AVG_ROUNDING (AVG_DIV/2)
+            // Average frame interval tracking
+            self->frame_count++;
+            if (units[i].type == 5 && self->frame_count >= MIN_FRAMES_CALC_INTERVAL) {
+                // Throw away the first set results as they can be quite noisy
+                if (self->prev_int_ts != 0) {
+                    #define AVG_DIV 20
+                    #define AVG_MULT 1
+                    #define AVG_ROUNDING (AVG_DIV/2)
 
-            int64_t diff = libuvc_ts - self->prev_uvc_ts;
-            diff = CLAMP(diff, 0, self->frame_interval*2);
-            self->frame_interval = ((self->frame_interval + AVG_ROUNDING) / AVG_DIV * (AVG_DIV - AVG_MULT)) +
-                                   ((diff + AVG_ROUNDING) / AVG_DIV * AVG_MULT);
-            self->prev_uvc_ts = libuvc_ts;
+                    uint64_t interval = (libuvc_ts - self->prev_int_ts) / self->frame_count;
+                    self->frame_interval = (self->frame_interval * (AVG_DIV-AVG_MULT) +
+                                                interval + AVG_ROUNDING) / AVG_DIV;
+                }
+                self->frame_count = 0;
+                self->prev_int_ts = libuvc_ts;
+            }
+
+            GstClockTime timestamp = self->prev_pts + self->frame_interval;
 
             /* Determine if we need to slightly speed up or slow down the PTSes
                to track the average libuvc timestamps */
-            GstClockTime timestamp = self->prev_pts + self->frame_interval;
-            diff = libuvc_ts - timestamp;
-            int64_t adj = 0;
-            if (diff > self->frame_interval || diff < -self->frame_interval) {
-                adj = diff / 100;
-                adj = CLAMP(diff, -self->frame_interval / 10, self->frame_interval / 10);
+            /* Don't adjust the timestamps while we're reciving the first few
+               frames as the timing can be quite noisy */
+            if (self->prev_int_ts != 0) {
+                int64_t diff = libuvc_ts - timestamp;
+                int64_t adj = 0;
+                // +/- 2-frame interval hysteresis
+                if (diff < (-2 * self->frame_interval) || diff > (2 * self->frame_interval)) {
+                    adj = diff / 5;
+                    adj = CLAMP(diff, -self->frame_interval / 2, self->frame_interval / 2);
+                }
+                timestamp += adj;
             }
-            timestamp += adj;
 
             GST_BUFFER_PTS(buffer) = timestamp;
             GST_BUFFER_DTS(buffer) = timestamp;

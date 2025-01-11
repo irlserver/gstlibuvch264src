@@ -18,6 +18,8 @@ G_DECLARE_FINAL_TYPE(GstLibuvcH264Src, gst_libuvc_h264_src, GST, LIBUVC_H264_SRC
 
 #define SPSPPSBUFSZ 1024
 
+#define MIN_FRAMES_CALC_INTERVAL 60
+
 struct _GstLibuvcH264Src {
   GstPushSrc parent_instance;
   gchar* index;
@@ -28,9 +30,10 @@ struct _GstLibuvcH264Src {
   GAsyncQueue *frame_queue;
   gboolean streaming;
   GstClockTime uvc_start_time;
-  GstClockTime prev_uvc_ts;
   GstClockTime prev_pts;
   gint64 frame_interval; // in ns
+  guint64 prev_int_ts;
+  gint frame_count;
   gboolean had_idr;
   gboolean send_sps_pps;
   gint sps_length;
