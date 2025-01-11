@@ -460,26 +460,34 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
 
     for (int i = 0; i < c; i++) {
         nal_unit_t *unit = &units[i];
+        GstBuffer *buffer = NULL;
+        gsize buffer_offset = 0;
 
         switch (unit->type) {
             case 7:
                 self->sps_length = unit->len;
                 memcpy(self->sps, unit->ptr, self->sps_length);
                 updated_sps_pps = TRUE;
-                break;
+                self->send_sps_pps = TRUE;
+                // deliberately not sending SPS/PPS info in their own buffer
+                continue;
             case 8:
                 self->pps_length = unit->len;
                 memcpy(self->pps, unit->ptr, self->pps_length);
                 updated_sps_pps = TRUE;
-                break;
+                self->send_sps_pps = TRUE;
+                // deliberately not sending SPS/PPS info in their own buffer
+                continue;
             case 5: {
-                if (!self->had_idr) {
-                    self->had_idr = TRUE;
-
-                    GstBuffer *buffer = gst_buffer_new_allocate(NULL, self->sps_length + self->pps_length, NULL);
+                if (!self->had_idr || self->send_sps_pps) {
+                    buffer_offset = self->sps_length + self->pps_length;
+                    buffer = gst_buffer_new_allocate(NULL, buffer_offset + unit->len, NULL);
                     gst_buffer_fill(buffer, 0, self->sps, self->sps_length);
                     gst_buffer_fill(buffer, self->sps_length, self->pps, self->pps_length);
-                    g_async_queue_push(self->frame_queue, buffer);
+                    self->send_sps_pps = FALSE;
+                }
+                if (!self->had_idr) {
+                    self->had_idr = TRUE;
                 }
                 break;
             }
@@ -489,8 +497,10 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
                 }
         } // switch
 
-        GstBuffer *buffer = gst_buffer_new_allocate(NULL, unit->len, NULL);
-        gst_buffer_fill(buffer, 0, unit->ptr, unit->len);
+        if (!buffer) {
+          buffer = gst_buffer_new_allocate(NULL, unit->len, NULL);
+        }
+        gst_buffer_fill(buffer, buffer_offset, unit->ptr, unit->len);
 
         // Set timestamps on the buffer
         if (units[i].type == 1 || units[i].type == 5) {
@@ -507,28 +517,39 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
                 self->prev_pts = libuvc_ts - self->frame_interval;
             }
 
-            /* Use the difference beween current and previous libuvc
-               timestamps to update the rolling average frame interval */
-            #define AVG_DIV 1000
-            #define AVG_MULT 1
-            #define AVG_ROUNDING (AVG_DIV/2)
+            // Average frame interval tracking
+            self->frame_count++;
+            if (units[i].type == 5 && self->frame_count >= MIN_FRAMES_CALC_INTERVAL) {
+                // Throw away the first set results as they can be quite noisy
+                if (self->prev_int_ts != 0) {
+                    #define AVG_DIV 20
+                    #define AVG_MULT 1
+                    #define AVG_ROUNDING (AVG_DIV/2)
 
-            int64_t diff = libuvc_ts - self->prev_uvc_ts;
-            diff = CLAMP(diff, 0, self->frame_interval*2);
-            self->frame_interval = ((self->frame_interval + AVG_ROUNDING) / AVG_DIV * (AVG_DIV - AVG_MULT)) +
-                                   ((diff + AVG_ROUNDING) / AVG_DIV * AVG_MULT);
-            self->prev_uvc_ts = libuvc_ts;
+                    uint64_t interval = (libuvc_ts - self->prev_int_ts) / self->frame_count;
+                    self->frame_interval = (self->frame_interval * (AVG_DIV-AVG_MULT) +
+                                                interval + AVG_ROUNDING) / AVG_DIV;
+                }
+                self->frame_count = 0;
+                self->prev_int_ts = libuvc_ts;
+            }
+
+            GstClockTime timestamp = self->prev_pts + self->frame_interval;
 
             /* Determine if we need to slightly speed up or slow down the PTSes
                to track the average libuvc timestamps */
-            GstClockTime timestamp = self->prev_pts + self->frame_interval;
-            diff = libuvc_ts - timestamp;
-            int64_t adj = 0;
-            if (diff > self->frame_interval || diff < -self->frame_interval) {
-                adj = diff / 100;
-                adj = CLAMP(diff, -self->frame_interval / 10, self->frame_interval / 10);
+            /* Don't adjust the timestamps while we're reciving the first few
+               frames as the timing can be quite noisy */
+            if (self->prev_int_ts != 0) {
+                int64_t diff = libuvc_ts - timestamp;
+                int64_t adj = 0;
+                // +/- 2-frame interval hysteresis
+                if (diff < (-2 * self->frame_interval) || diff > (2 * self->frame_interval)) {
+                    adj = diff / 5;
+                    adj = CLAMP(diff, -self->frame_interval / 2, self->frame_interval / 2);
+                }
+                timestamp += adj;
             }
-            timestamp += adj;
 
             GST_BUFFER_PTS(buffer) = timestamp;
             GST_BUFFER_DTS(buffer) = timestamp;
