@@ -1,6 +1,8 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <fcntl.h>
+#include <sys/select.h>
 #include <libusb-1.0/libusb.h>
 #include "gstlibuvch264src.h"
 #include <gst/gst.h>
@@ -221,12 +223,14 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   gst_base_src_set_format(GST_BASE_SRC(self), GST_FORMAT_TIME);
 }
 
-// Control socket thread function
+// Enhanced control socket thread function with proper shutdown
 static gpointer gst_libuvc_h264_src_control_thread(gpointer data) {
     GstLibuvcH264Src *self = (GstLibuvcH264Src *)data;
     struct sockaddr_un addr;
     int client_fd;
     char buffer[256];
+    fd_set read_fds;
+    struct timeval timeout;
     
     // Create socket
     self->control_socket = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -234,6 +238,10 @@ static gpointer gst_libuvc_h264_src_control_thread(gpointer data) {
         GST_ERROR_OBJECT(self, "Failed to create control socket");
         return NULL;
     }
+    
+    // Set socket to non-blocking for clean shutdown
+    int flags = fcntl(self->control_socket, F_GETFL, 0);
+    fcntl(self->control_socket, F_SETFL, flags | O_NONBLOCK);
     
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
@@ -259,28 +267,45 @@ static gpointer gst_libuvc_h264_src_control_thread(gpointer data) {
     GST_INFO_OBJECT(self, "Control socket listening on /tmp/libuvc_control");
     
     while (self->control_running) {
-        client_fd = accept(self->control_socket, NULL, NULL);
-        if (client_fd > 0) {
-            ssize_t len = read(client_fd, buffer, sizeof(buffer)-1);
-            if (len > 0) {
-                buffer[len] = 0;
-                GST_INFO_OBJECT(self, "Received control command: %s", buffer);
-                char *response = gst_libuvc_h264_src_process_control_command(self, buffer);
-                if (response) {
-                    write(client_fd, response, strlen(response));
-                    g_free(response);
-                } else {
-                    const char *default_response = "OK";
-                    write(client_fd, default_response, strlen(default_response));
+        FD_ZERO(&read_fds);
+        FD_SET(self->control_socket, &read_fds);
+        
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+        
+        int result = select(self->control_socket + 1, &read_fds, NULL, NULL, &timeout);
+        
+        if (result > 0 && FD_ISSET(self->control_socket, &read_fds)) {
+            client_fd = accept(self->control_socket, NULL, NULL);
+            if (client_fd > 0) {
+                ssize_t len = read(client_fd, buffer, sizeof(buffer)-1);
+                if (len > 0) {
+                    buffer[len] = 0;
+                    GST_INFO_OBJECT(self, "Received control command: %s", buffer);
+                    char *response = gst_libuvc_h264_src_process_control_command(self, buffer);
+                    if (response) {
+                        write(client_fd, response, strlen(response));
+                        g_free(response);
+                    } else {
+                        const char *default_response = "OK";
+                        write(client_fd, default_response, strlen(default_response));
+                    }
                 }
+                close(client_fd);
             }
-            close(client_fd);
+        } else if (result == 0) {
+            // Timeout - check if we should continue running
+            continue;
         } else {
-            // Small delay to prevent busy waiting
-            usleep(100000); // 100ms
+            // Error or interrupted
+            if (self->control_running) {
+                GST_WARNING_OBJECT(self, "Select error in control thread");
+            }
+            break;
         }
     }
     
+    GST_DEBUG_OBJECT(self, "Control thread exiting");
     return NULL;
 }
 
@@ -546,6 +571,8 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(src);
   uvc_error_t res;
 
+  GST_DEBUG_OBJECT(self, "Starting libuvc source");
+
   // Initialize libuvc context
   res = uvc_init(&self->uvc_ctx, NULL);
   if (res < 0) {
@@ -592,50 +619,92 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
 
   load_spspps(self);
 
+  GST_DEBUG_OBJECT(self, "Libuvc source started successfully");
   return TRUE;
 }
 
+// Enhanced stop function with proper cleanup sequence
 static gboolean gst_libuvc_h264_src_stop(GstBaseSrc *src) {
   GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(src);
 
-  // Stop control thread
+  GST_DEBUG_OBJECT(self, "Stopping libuvc source");
+
+  // Stop control thread first
   if (self->control_running) {
+    GST_DEBUG_OBJECT(self, "Stopping control thread");
     self->control_running = FALSE;
+    
+    // Force accept to wake up by connecting to the socket
+    int wakeup_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (wakeup_fd >= 0) {
+      struct sockaddr_un addr;
+      memset(&addr, 0, sizeof(addr));
+      addr.sun_family = AF_UNIX;
+      strcpy(addr.sun_path, "/tmp/libuvc_control");
+      connect(wakeup_fd, (struct sockaddr*)&addr, sizeof(addr));
+      close(wakeup_fd);
+    }
+    
     if (self->control_thread) {
       g_thread_join(self->control_thread);
       self->control_thread = NULL;
+      GST_DEBUG_OBJECT(self, "Control thread stopped");
     }
   }
 
+  // Close control socket
   if (self->control_socket >= 0) {
+    GST_DEBUG_OBJECT(self, "Closing control socket");
     close(self->control_socket);
     self->control_socket = -1;
     // Remove socket file
     unlink("/tmp/libuvc_control");
   }
 
-  if (self->streaming) {
+  // Stop streaming FIRST - this is crucial!
+  if (self->streaming && self->uvc_devh) {
+    GST_DEBUG_OBJECT(self, "Stopping UVC streaming");
     uvc_stop_streaming(self->uvc_devh);
     self->streaming = FALSE;
+    
+    // Small delay to ensure streaming is fully stopped
+    usleep(100000); // 100ms
   }
 
+  // Clear the frame queue to release any pending buffers
+  if (self->frame_queue) {
+    GST_DEBUG_OBJECT(self, "Clearing frame queue");
+    GstBuffer *buffer;
+    while ((buffer = g_async_queue_try_pop(self->frame_queue)) != NULL) {
+      gst_buffer_unref(buffer);
+    }
+  }
+
+  // Close UVC device handle
   if (self->uvc_devh) {
+    GST_DEBUG_OBJECT(self, "Closing UVC device handle");
     uvc_close(self->uvc_devh);
     self->uvc_devh = NULL;
   }
 
+  // Unreference UVC device
   if (self->uvc_dev) {
+    GST_DEBUG_OBJECT(self, "Unreferencing UVC device");
     uvc_unref_device(self->uvc_dev);
     self->uvc_dev = NULL;
   }
 
+  // Exit UVC context
   if (self->uvc_ctx) {
+    GST_DEBUG_OBJECT(self, "Exiting UVC context");
     uvc_exit(self->uvc_ctx);
     self->uvc_ctx = NULL;
   }
 
+  // Clear control mutex
   g_mutex_clear(&self->control_mutex);
 
+  GST_DEBUG_OBJECT(self, "Libuvc source fully stopped");
   return TRUE;
 }
 
@@ -796,35 +865,36 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
   return GST_FLOW_OK;
 }
 
+// Enhanced finalize function
 static void gst_libuvc_h264_src_finalize(GObject *object) {
     GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(object);
 
-    // Ensure streaming is stopped
-    if (self->streaming) {
-        uvc_stop_streaming(self->uvc_devh);
-        self->streaming = FALSE;
-    }
+    GST_DEBUG_OBJECT(self, "Finalizing libuvc source");
 
-    // Stop control thread
-    if (self->control_running) {
-        self->control_running = FALSE;
-        if (self->control_thread) {
-            g_thread_join(self->control_thread);
-        }
-    }
+    // Ensure everything is stopped (in case stop wasn't called)
+    gst_libuvc_h264_src_stop(GST_BASE_SRC(self));
 
-    if (self->control_socket >= 0) {
-        close(self->control_socket);
-        unlink("/tmp/libuvc_control");
+    // Free the index string
+    if (self->index) {
+        g_free(self->index);
+        self->index = NULL;
     }
 
     // Unreference and free the frame queue
     if (self->frame_queue) {
+        GST_DEBUG_OBJECT(self, "Unreffing frame queue");
+        
+        // Drain any remaining buffers
+        GstBuffer *buffer;
+        while ((buffer = g_async_queue_try_pop(self->frame_queue)) != NULL) {
+            gst_buffer_unref(buffer);
+        }
+        
         g_async_queue_unref(self->frame_queue);
         self->frame_queue = NULL;
     }
 
-    g_mutex_clear(&self->control_mutex);
+    GST_DEBUG_OBJECT(self, "Libuvc source finalized");
 
     // Chain up to the parent class
     G_OBJECT_CLASS(gst_libuvc_h264_src_parent_class)->finalize(object);
