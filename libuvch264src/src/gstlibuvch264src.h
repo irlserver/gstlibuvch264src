@@ -40,6 +40,12 @@ struct _GstLibuvcH264Src {
   gint pps_length;
   unsigned char sps[SPSPPSBUFSZ];
   unsigned char pps[SPSPPSBUFSZ];
+  
+  // Control socket additions
+  gint control_socket;
+  gpointer control_thread;
+  gboolean control_running;
+  GMutex control_mutex;
 };
 
 G_END_DECLS
