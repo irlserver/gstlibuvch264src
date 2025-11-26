@@ -1,4 +1,6 @@
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <libusb-1.0/libusb.h>
 #include "gstlibuvch264src.h"
 #include <gst/gst.h>
@@ -40,6 +42,10 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src);
 static gboolean gst_libuvc_h264_src_stop(GstBaseSrc *src);
 static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf);
 static void gst_libuvc_h264_src_finalize(GObject *object);
+
+// Control socket functions
+static gpointer gst_libuvc_h264_src_control_thread(GstLibuvcH264Src *self);
+static void gst_libuvc_h264_src_process_control_command(GstLibuvcH264Src *self, const char *command);
 
 static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
   GObjectClass *gobject_class = G_OBJECT_CLASS(klass);
@@ -195,6 +201,12 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->streaming = FALSE;
   self->uvc_start_time = G_MAXUINT64;
   self->prev_pts = G_MAXUINT64;
+  
+  // Control socket initialization
+  self->control_socket = -1;
+  self->control_thread = NULL;
+  self->control_running = FALSE;
+  g_mutex_init(&self->control_mutex);
 
   // Initialization, not fixed
   gchar sps[] = { 0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x34, 0xAC, 0x4D, 0x00, 0xF0, 0x04, 0x4F, 0xCB, 0x35, 0x01, 0x01, 0x01, 0x40, 0x00, 0x00, 0xFA, 0x00, 0x00, 0x3A, 0x98, 0x03, 0xC7, 0x0C, 0xA8 };
@@ -207,6 +219,93 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
 
   gst_base_src_set_live(GST_BASE_SRC(self), TRUE);
   gst_base_src_set_format(GST_BASE_SRC(self), GST_FORMAT_TIME);
+}
+
+// Control socket thread function
+static gpointer gst_libuvc_h264_src_control_thread(GstLibuvcH264Src *self) {
+    struct sockaddr_un addr;
+    int client_fd;
+    char buffer[256];
+    
+    // Create socket
+    self->control_socket = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (self->control_socket < 0) {
+        GST_ERROR_OBJECT(self, "Failed to create control socket");
+        return NULL;
+    }
+    
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, "/tmp/libuvc_control");
+    
+    // Remove existing socket
+    unlink(addr.sun_path);
+    
+    if (bind(self->control_socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        GST_ERROR_OBJECT(self, "Failed to bind control socket");
+        close(self->control_socket);
+        self->control_socket = -1;
+        return NULL;
+    }
+    
+    if (listen(self->control_socket, 5) < 0) {
+        GST_ERROR_OBJECT(self, "Failed to listen on control socket");
+        close(self->control_socket);
+        self->control_socket = -1;
+        return NULL;
+    }
+    
+    GST_INFO_OBJECT(self, "Control socket listening on /tmp/libuvc_control");
+    
+    while (self->control_running) {
+        client_fd = accept(self->control_socket, NULL, NULL);
+        if (client_fd > 0) {
+            ssize_t len = read(client_fd, buffer, sizeof(buffer)-1);
+            if (len > 0) {
+                buffer[len] = 0;
+                GST_INFO_OBJECT(self, "Received control command: %s", buffer);
+                gst_libuvc_h264_src_process_control_command(self, buffer);
+                
+                // Send response
+                const char *response = "OK";
+                write(client_fd, response, strlen(response));
+            }
+            close(client_fd);
+        } else {
+            // Small delay to prevent busy waiting
+            usleep(100000); // 100ms
+        }
+    }
+    
+    return NULL;
+}
+
+// Process control commands
+static void gst_libuvc_h264_src_process_control_command(GstLibuvcH264Src *self, const char *command) {
+    int pan, tilt;
+    
+    g_mutex_lock(&self->control_mutex);
+    
+    if (sscanf(command, "PAN_TILT %d %d", &pan, &tilt) == 2) {
+        if (self->uvc_devh) {
+            uvc_error_t res = uvc_set_pantilt_abs(self->uvc_devh, pan, tilt);
+            if (res == UVC_SUCCESS) {
+                GST_INFO_OBJECT(self, "Set pan/tilt to: %d/%d", pan, tilt);
+            } else {
+                GST_WARNING_OBJECT(self, "Failed to set pan/tilt: %s", uvc_strerror(res));
+            }
+        }
+    } else if (strcmp(command, "GET_POSITION") == 0) {
+        if (self->uvc_devh) {
+            int32_t current_pan, current_tilt;
+            uvc_error_t res = uvc_get_pantilt_abs(self->uvc_devh, &current_pan, &current_tilt, UVC_GET_CUR);
+            if (res == UVC_SUCCESS) {
+                GST_INFO_OBJECT(self, "Current position: pan=%d, tilt=%d", current_pan, current_tilt);
+            }
+        }
+    }
+    
+    g_mutex_unlock(&self->control_mutex);
 }
 
 static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
@@ -404,6 +503,12 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
     return FALSE;
   }
 
+  // Start control socket thread
+  self->control_running = TRUE;
+  self->control_thread = g_thread_new("uvc-control", 
+                                     (GThreadFunc)gst_libuvc_h264_src_control_thread, 
+                                     self);
+
   load_spspps(self);
 
   return TRUE;
@@ -411,6 +516,22 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
 
 static gboolean gst_libuvc_h264_src_stop(GstBaseSrc *src) {
   GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(src);
+
+  // Stop control thread
+  if (self->control_running) {
+    self->control_running = FALSE;
+    if (self->control_thread) {
+      g_thread_join(self->control_thread);
+      self->control_thread = NULL;
+    }
+  }
+
+  if (self->control_socket >= 0) {
+    close(self->control_socket);
+    self->control_socket = -1;
+    // Remove socket file
+    unlink("/tmp/libuvc_control");
+  }
 
   if (self->streaming) {
     uvc_stop_streaming(self->uvc_devh);
@@ -431,6 +552,8 @@ static gboolean gst_libuvc_h264_src_stop(GstBaseSrc *src) {
     uvc_exit(self->uvc_ctx);
     self->uvc_ctx = NULL;
   }
+
+  g_mutex_clear(&self->control_mutex);
 
   return TRUE;
 }
@@ -601,11 +724,26 @@ static void gst_libuvc_h264_src_finalize(GObject *object) {
         self->streaming = FALSE;
     }
 
+    // Stop control thread
+    if (self->control_running) {
+        self->control_running = FALSE;
+        if (self->control_thread) {
+            g_thread_join(self->control_thread);
+        }
+    }
+
+    if (self->control_socket >= 0) {
+        close(self->control_socket);
+        unlink("/tmp/libuvc_control");
+    }
+
     // Unreference and free the frame queue
     if (self->frame_queue) {
         g_async_queue_unref(self->frame_queue);
         self->frame_queue = NULL;
     }
+
+    g_mutex_clear(&self->control_mutex);
 
     // Chain up to the parent class
     G_OBJECT_CLASS(gst_libuvc_h264_src_parent_class)->finalize(object);
