@@ -45,11 +45,7 @@ struct _GstLibuvcH264Src {
   gint control_socket;
   gpointer control_thread;
   gboolean control_running;
-  gpointer keepalive_thread;
-  gboolean keepalive_running;
-  gboolean camera_active;
   GMutex control_mutex;
-  GMutex camera_mutex;
 };
 
 G_END_DECLS
