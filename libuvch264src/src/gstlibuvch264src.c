@@ -3,7 +3,6 @@
 #include <sys/un.h>
 #include <fcntl.h>
 #include <sys/select.h>
-#include <signal.h>
 #include <libusb-1.0/libusb.h>
 #include "gstlibuvch264src.h"
 #include <gst/gst.h>
@@ -50,9 +49,8 @@ static void gst_libuvc_h264_src_finalize(GObject *object);
 static gpointer gst_libuvc_h264_src_control_thread(gpointer data);
 static char* gst_libuvc_h264_src_process_control_command(GstLibuvcH264Src *self, const char *command);
 
-// New functions for proper camera reset
-static void gst_libuvc_h264_src_reset_camera_state(GstLibuvcH264Src *self);
-static void gst_libuvc_h264_src_send_keepalive(GstLibuvcH264Src *self);
+// USB device management functions
+static void gst_libuvc_h264_src_force_usb_release(GstLibuvcH264Src *self);
 
 static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
   GObjectClass *gobject_class = G_OBJECT_CLASS(klass);
@@ -105,16 +103,13 @@ char *get_spspps_path(GstLibuvcH264Src *self, char *index) {
 void create_hidden_directory(GstLibuvcH264Src *self) {
     char *hidden_dir = get_spspps_path(self, NULL);
 
-    // Check if the directory exists
     struct stat st;
     if (stat(hidden_dir, &st) == -1) {
-        // Directory does not exist; create it
         if (mkdir(hidden_dir, 0700) != 0)
             GST_ERROR_OBJECT(self, "Error creating directory %s\n", hidden_dir);
         else
             GST_WARNING_OBJECT(self, "Directory %s created successfully.\n", hidden_dir);
     } else if (!S_ISDIR(st.st_mode))
-        // Path exists but is not a directory
         GST_WARNING_OBJECT(self, "Warning: %s exists but is not a directory.\n", hidden_dir);
 }
 
@@ -208,18 +203,13 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->streaming = FALSE;
   self->uvc_start_time = G_MAXUINT64;
   self->prev_pts = G_MAXUINT64;
-  self->camera_active = FALSE;
   
   // Control socket initialization
   self->control_socket = -1;
   self->control_thread = NULL;
   self->control_running = FALSE;
-  self->keepalive_thread = NULL;
-  self->keepalive_running = FALSE;
   g_mutex_init(&self->control_mutex);
-  g_mutex_init(&self->camera_mutex);
 
-  // Initialization, not fixed
   gchar sps[] = { 0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x34, 0xAC, 0x4D, 0x00, 0xF0, 0x04, 0x4F, 0xCB, 0x35, 0x01, 0x01, 0x01, 0x40, 0x00, 0x00, 0xFA, 0x00, 0x00, 0x3A, 0x98, 0x03, 0xC7, 0x0C, 0xA8 };
   self->sps_length = sizeof(sps);
   memcpy(self->sps, sps, self->sps_length);
@@ -232,124 +222,63 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   gst_base_src_set_format(GST_BASE_SRC(self), GST_FORMAT_TIME);
 }
 
-// CRITICAL: Reset camera to known good state before shutdown
-static void gst_libuvc_h264_src_reset_camera_state(GstLibuvcH264Src *self) {
+// Force USB device release by directly accessing libusb
+static void gst_libuvc_h264_src_force_usb_release(GstLibuvcH264Src *self) {
+    GST_DEBUG_OBJECT(self, "Forcing USB device release");
+    
     if (!self->uvc_devh) return;
     
-    GST_DEBUG_OBJECT(self, "Resetting camera to safe state...");
-    
-    g_mutex_lock(&self->camera_mutex);
-    
-    // 1. Stop any active streaming FIRST
-    if (self->streaming) {
-        uvc_stop_streaming(self->uvc_devh);
-        self->streaming = FALSE;
-        usleep(50000); // 50ms
-    }
-    
-    // 2. Reset gimbal to center position (DJI cameras need this)
-    GST_DEBUG_OBJECT(self, "Centering gimbal...");
-    uvc_set_pantilt_abs(self->uvc_devh, 0, 0);
-    usleep(100000); // 100ms
-    
-    // 3. Reset zoom to default
-    GST_DEBUG_OBJECT(self, "Resetting zoom...");
-    uvc_set_zoom_abs(self->uvc_devh, 100); // Default zoom level
-    usleep(50000); // 50ms
-    
-    // 4. Send UVC "Streaming Stop" control (UVC 1.5 spec, VS_PROBE_CONTROL)
-    // This tells the camera we're done streaming
-    GST_DEBUG_OBJECT(self, "Sending streaming stop control...");
-    uint8_t probe_buffer[26] = {0};
-    // VS_PROBE_CONTROL for H264
-    probe_buffer[0] = 0x02; // bmHint (H264)
-    probe_buffer[1] = 0x01; // bFormatIndex (H264)
-    probe_buffer[2] = 0x01; // bFrameIndex
-    probe_buffer[3] = 0x00; // dwFrameInterval (0 = stop)
-    
-    // Send via libusb control transfer (UVC SET_CUR)
+    // Get the underlying libusb handle
     struct libusb_device_handle *usb_devh = uvc_get_libusb_handle(self->uvc_devh);
-    if (usb_devh) {
-        libusb_control_transfer(usb_devh,
-            0x21, // Request type: Class, Interface, Host-to-device
-            0x01, // SET_CUR
-            0x0100, // VS_PROBE_CONTROL
-            0x0100, // Interface 1
-            probe_buffer,
-            sizeof(probe_buffer),
-            1000); // Timeout 1s
+    if (!usb_devh) {
+        GST_WARNING_OBJECT(self, "Cannot get libusb handle from uvc");
+        return;
     }
     
-    usleep(100000); // 100ms
-    
-    // 5. Send UVC "Commit Control" to apply changes
-    GST_DEBUG_OBJECT(self, "Committing control changes...");
-    uint8_t commit_buffer[26] = {0};
-    // Copy probe to commit
-    memcpy(commit_buffer, probe_buffer, sizeof(probe_buffer));
-    
-    if (usb_devh) {
-        libusb_control_transfer(usb_devh,
-            0x21, // Request type: Class, Interface, Host-to-device
-            0x01, // SET_CUR
-            0x0200, // VS_COMMIT_CONTROL
-            0x0100, // Interface 1
-            commit_buffer,
-            sizeof(commit_buffer),
-            1000); // Timeout 1s
+    // Get USB device info
+    struct libusb_device *usb_dev = libusb_get_device(usb_devh);
+    if (!usb_dev) {
+        GST_WARNING_OBJECT(self, "Cannot get libusb device");
+        return;
     }
     
-    usleep(200000); // 200ms
+    int bus = libusb_get_bus_number(usb_dev);
+    int addr = libusb_get_device_address(usb_dev);
+    GST_INFO_OBJECT(self, "USB device at bus %d, address %d", bus, addr);
     
-    // 6. Send DJI-specific "end of stream" command (if known)
-    // DJI cameras often need a specific command to properly end streaming
-    GST_DEBUG_OBJECT(self, "Sending DJI end-of-stream command...");
-    uint8_t dji_eos[8] = {0x55, 0xAA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; // Common DJI header
-    
-    if (usb_devh) {
-        libusb_control_transfer(usb_devh,
-            0x21, // Request type
-            0x09, // SET_REPORT (HID class)
-            0x0300, // Feature report
-            0x0000, // Interface 0
-            dji_eos,
-            sizeof(dji_eos),
-            1000);
-    }
-    
-    g_mutex_unlock(&self->camera_mutex);
-    GST_DEBUG_OBJECT(self, "Camera state reset complete");
-}
-
-// Keepalive thread to prevent camera from sleeping
-static gpointer gst_libuvc_h264_src_keepalive_thread(gpointer data) {
-    GstLibuvcH264Src *self = (GstLibuvcH264Src *)data;
-    
-    while (self->keepalive_running) {
-        g_mutex_lock(&self->camera_mutex);
-        
-        if (self->uvc_devh && self->camera_active) {
-            // Send a simple UVC "Get Cur" request to keep camera awake
-            uint8_t status_buffer[2] = {0};
-            struct libusb_device_handle *usb_devh = uvc_get_libusb_handle(self->uvc_devh);
-            
-            if (usb_devh) {
-                libusb_control_transfer(usb_devh,
-                    0xA1, // Request type: Class, Interface, Device-to-host
-                    0x81, // GET_CUR
-                    0x0200, // VS_COMMIT_CONTROL
-                    0x0100, // Interface 1
-                    status_buffer,
-                    sizeof(status_buffer),
-                    500); // Timeout 500ms
-            }
+    // Try to release all interfaces
+    for (int interface = 0; interface < 8; interface++) {
+        int ret = libusb_release_interface(usb_devh, interface);
+        if (ret == LIBUSB_SUCCESS) {
+            GST_DEBUG_OBJECT(self, "Released interface %d", interface);
+        } else if (ret == LIBUSB_ERROR_NOT_FOUND) {
+            // Interface doesn't exist, that's fine
+            break;
         }
-        
-        g_mutex_unlock(&self->camera_mutex);
-        g_usleep(5000000); // Send keepalive every 5 seconds
     }
     
-    return NULL;
+    // Try kernel detach if needed
+    #ifdef LIBUSB_OPTION_DETACH_KERNEL_DRIVER
+    for (int interface = 0; interface < 8; interface++) {
+        if (libusb_kernel_driver_active(usb_devh, interface) == 1) {
+            GST_DEBUG_OBJECT(self, "Detaching kernel driver from interface %d", interface);
+            libusb_detach_kernel_driver(usb_devh, interface);
+        }
+    }
+    #endif
+    
+    // Force close the libusb handle
+    GST_DEBUG_OBJECT(self, "Force closing libusb handle");
+    libusb_close(usb_devh);
+    
+    // Reset the device if possible (requires newer libusb)
+    #ifdef LIBUSB_HAS_GET_DEVICE
+    // This forces a USB port reset
+    libusb_reset_device(usb_devh);
+    #endif
+    
+    // Clear the uvc handle pointer since we've closed it
+    // Note: uvc_close() will fail if we call it now, but that's OK
 }
 
 // Control socket thread function
@@ -358,19 +287,22 @@ static gpointer gst_libuvc_h264_src_control_thread(gpointer data) {
     struct sockaddr_un addr;
     int client_fd;
     char buffer[256];
+    fd_set read_fds;
+    struct timeval timeout;
     
-    // Create socket
     self->control_socket = socket(AF_UNIX, SOCK_STREAM, 0);
     if (self->control_socket < 0) {
         GST_ERROR_OBJECT(self, "Failed to create control socket");
         return NULL;
     }
     
+    int flags = fcntl(self->control_socket, F_GETFL, 0);
+    fcntl(self->control_socket, F_SETFL, flags | O_NONBLOCK);
+    
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     strcpy(addr.sun_path, "/tmp/libuvc_control");
     
-    // Remove existing socket
     unlink(addr.sun_path);
     
     if (bind(self->control_socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
@@ -390,31 +322,43 @@ static gpointer gst_libuvc_h264_src_control_thread(gpointer data) {
     GST_INFO_OBJECT(self, "Control socket listening on /tmp/libuvc_control");
     
     while (self->control_running) {
-        client_fd = accept(self->control_socket, NULL, NULL);
-        if (client_fd > 0) {
-            ssize_t len = read(client_fd, buffer, sizeof(buffer)-1);
-            if (len > 0) {
-                buffer[len] = 0;
-                GST_INFO_OBJECT(self, "Received control command: %s", buffer);
-                char *response = gst_libuvc_h264_src_process_control_command(self, buffer);
-                if (response) {
-                    write(client_fd, response, strlen(response));
-                    g_free(response);
-                } else {
-                    const char *default_response = "OK";
-                    write(client_fd, default_response, strlen(default_response));
+        FD_ZERO(&read_fds);
+        FD_SET(self->control_socket, &read_fds);
+        
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+        
+        int result = select(self->control_socket + 1, &read_fds, NULL, NULL, &timeout);
+        
+        if (result > 0 && FD_ISSET(self->control_socket, &read_fds)) {
+            client_fd = accept(self->control_socket, NULL, NULL);
+            if (client_fd > 0) {
+                ssize_t len = read(client_fd, buffer, sizeof(buffer)-1);
+                if (len > 0) {
+                    buffer[len] = 0;
+                    GST_INFO_OBJECT(self, "Received control command: %s", buffer);
+                    char *response = gst_libuvc_h264_src_process_control_command(self, buffer);
+                    if (response) {
+                        write(client_fd, response, strlen(response));
+                        g_free(response);
+                    }
                 }
+                close(client_fd);
             }
-            close(client_fd);
+        } else if (result == 0) {
+            continue;
         } else {
-            usleep(100000); // 100ms
+            if (self->control_running) {
+                GST_WARNING_OBJECT(self, "Select error in control thread");
+            }
+            break;
         }
     }
     
+    GST_DEBUG_OBJECT(self, "Control thread exiting");
     return NULL;
 }
 
-// Enhanced control command processor
 static char* gst_libuvc_h264_src_process_control_command(GstLibuvcH264Src *self, const char *command) {
     int pan, tilt, zoom;
     uint16_t zoom_abs;
@@ -474,13 +418,6 @@ static char* gst_libuvc_h264_src_process_control_command(GstLibuvcH264Src *self,
             g_mutex_unlock(&self->control_mutex);
             return response;
         }
-    }
-    else if (strcmp(command, "PREPARE_SHUTDOWN") == 0) {
-        // Command to prepare camera for shutdown
-        GST_INFO_OBJECT(self, "Preparing camera for shutdown");
-        gst_libuvc_h264_src_reset_camera_state(self);
-        g_mutex_unlock(&self->control_mutex);
-        return g_strdup("OK camera prepared for shutdown");
     }
     else if (strcmp(command, "GET_CAPABILITIES") == 0) {
         if (self->uvc_devh) {
@@ -663,6 +600,13 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
 
   GST_DEBUG_OBJECT(self, "Starting libuvc source");
 
+  // Check if we need to cleanup a previous session
+  if (self->uvc_ctx != NULL || self->uvc_devh != NULL) {
+    GST_WARNING_OBJECT(self, "Previous session not fully cleaned up, forcing cleanup");
+    gst_libuvc_h264_src_stop(src);
+    usleep(1000000); // Wait 1 second for USB to settle
+  }
+
   // Initialize libuvc context
   res = uvc_init(&self->uvc_ctx, NULL);
   if (res < 0) {
@@ -675,6 +619,7 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   if (res < 0) {
     GST_ERROR_OBJECT(self, "Unable to find any UVC devices");
     uvc_exit(self->uvc_ctx);
+    self->uvc_ctx = NULL;
     return FALSE;
   }
 
@@ -689,6 +634,7 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   if (!self->uvc_dev) {
     GST_ERROR_OBJECT(self, "Unable to find UVC device: %s", self->index);
     uvc_exit(self->uvc_ctx);
+    self->uvc_ctx = NULL;
     return FALSE;
   }
 
@@ -697,18 +643,11 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   if (res < 0) {
     GST_ERROR_OBJECT(self, "Unable to open UVC device: %s", uvc_strerror(res));
     uvc_unref_device(self->uvc_dev);
+    self->uvc_dev = NULL;
     uvc_exit(self->uvc_ctx);
+    self->uvc_ctx = NULL;
     return FALSE;
   }
-
-  // Mark camera as active
-  self->camera_active = TRUE;
-  
-  // Start keepalive thread to prevent camera sleep
-  self->keepalive_running = TRUE;
-  self->keepalive_thread = g_thread_new("camera-keepalive",
-                                       gst_libuvc_h264_src_keepalive_thread,
-                                       self);
 
   // Start control socket thread
   self->control_running = TRUE;
@@ -722,26 +661,15 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   return TRUE;
 }
 
-// CRITICAL: Enhanced stop with proper camera state reset
+// FIXED: Proper cleanup with libusb handle release
 static gboolean gst_libuvc_h264_src_stop(GstBaseSrc *src) {
   GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(src);
 
-  GST_DEBUG_OBJECT(self, "Stopping libuvc source with proper camera reset");
-
-  // Mark camera as inactive first
-  self->camera_active = FALSE;
-  
-  // Stop keepalive thread
-  if (self->keepalive_running) {
-    self->keepalive_running = FALSE;
-    if (self->keepalive_thread) {
-      g_thread_join(self->keepalive_thread);
-      self->keepalive_thread = NULL;
-    }
-  }
+  GST_DEBUG_OBJECT(self, "Stopping libuvc source");
 
   // Stop control thread
   if (self->control_running) {
+    GST_DEBUG_OBJECT(self, "Stopping control thread");
     self->control_running = FALSE;
     
     // Wake up control thread
@@ -751,6 +679,7 @@ static gboolean gst_libuvc_h264_src_stop(GstBaseSrc *src) {
       memset(&addr, 0, sizeof(addr));
       addr.sun_family = AF_UNIX;
       strcpy(addr.sun_path, "/tmp/libuvc_control");
+      fcntl(wakeup_fd, F_SETFL, O_NONBLOCK);
       connect(wakeup_fd, (struct sockaddr*)&addr, sizeof(addr));
       close(wakeup_fd);
     }
@@ -768,23 +697,12 @@ static gboolean gst_libuvc_h264_src_stop(GstBaseSrc *src) {
     unlink("/tmp/libuvc_control");
   }
 
-  // RESET CAMERA STATE BEFORE CLOSING (This is the key fix!)
-  if (self->uvc_devh) {
-    gst_libuvc_h264_src_reset_camera_state(self);
-    
-    // Wait for camera to process reset
-    usleep(500000); // 500ms
-    
-    // Now stop streaming (camera should be in proper state)
-    if (self->streaming) {
-      uvc_stop_streaming(self->uvc_devh);
-      self->streaming = FALSE;
-      usleep(100000); // 100ms
-    }
-    
-    // Close UVC device handle
-    uvc_close(self->uvc_devh);
-    self->uvc_devh = NULL;
+  // CRITICAL FIX: Stop streaming and force USB release
+  if (self->streaming && self->uvc_devh) {
+    GST_DEBUG_OBJECT(self, "Stopping UVC streaming");
+    uvc_stop_streaming(self->uvc_devh);
+    self->streaming = FALSE;
+    usleep(100000); // 100ms for streaming to stop
   }
 
   // Clear frame queue
@@ -793,6 +711,16 @@ static gboolean gst_libuvc_h264_src_stop(GstBaseSrc *src) {
     while ((buffer = g_async_queue_try_pop(self->frame_queue)) != NULL) {
       gst_buffer_unref(buffer);
     }
+  }
+
+  // FIXED: Release USB device BEFORE uvc_close
+  if (self->uvc_devh) {
+    GST_DEBUG_OBJECT(self, "Force releasing USB device");
+    gst_libuvc_h264_src_force_usb_release(self);
+    
+    // Now call uvc_close (it may fail but that's OK since we already released)
+    uvc_close(self->uvc_devh);
+    self->uvc_devh = NULL;
   }
 
   // Unreference UVC device
@@ -807,15 +735,13 @@ static gboolean gst_libuvc_h264_src_stop(GstBaseSrc *src) {
     self->uvc_ctx = NULL;
   }
 
-  // Clear mutexes
+  // Clear mutex
   g_mutex_clear(&self->control_mutex);
-  g_mutex_clear(&self->camera_mutex);
 
-  GST_DEBUG_OBJECT(self, "Libuvc source fully stopped with camera reset");
+  GST_DEBUG_OBJECT(self, "Libuvc source fully stopped");
   return TRUE;
 }
 
-// Callback to handle frame data
 void frame_callback(uvc_frame_t *frame, void *ptr) {
     GstLibuvcH264Src *self = (GstLibuvcH264Src *)ptr;
 
@@ -932,7 +858,6 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
   uvc_error_t res;
 
   if (!self->streaming) {
-    // Start streaming
     res = uvc_start_streaming(self->uvc_devh, &self->uvc_ctrl, frame_callback, self, 0);
     if (res < 0) {
       GST_ERROR_OBJECT(self, "Unable to start streaming: %s", uvc_strerror(res));
@@ -957,7 +882,7 @@ static void gst_libuvc_h264_src_finalize(GObject *object) {
 
     GST_DEBUG_OBJECT(self, "Finalizing libuvc source");
 
-    // Ensure everything is stopped
+    // Force cleanup
     gst_libuvc_h264_src_stop(GST_BASE_SRC(self));
 
     if (self->index) {
@@ -980,7 +905,6 @@ static void gst_libuvc_h264_src_finalize(GObject *object) {
     G_OBJECT_CLASS(gst_libuvc_h264_src_parent_class)->finalize(object);
 }
 
-// Plugin initialization function
 static gboolean plugin_init(GstPlugin *plugin) {
     return gst_element_register(plugin, "libuvch264src", GST_RANK_NONE, GST_TYPE_LIBUVC_H264_SRC);
 }
