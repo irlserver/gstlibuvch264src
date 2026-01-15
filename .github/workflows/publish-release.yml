@@ -1,0 +1,243 @@
+name: Publish Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: "Release type"
+        required: true
+        type: choice
+        options:
+          - stable
+          - beta
+        default: stable
+
+jobs:
+  calculate-version:
+    name: Calculate Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.calver.outputs.version }}
+      channel: ${{ steps.calver.outputs.channel }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Calculate CalVer version
+        id: calver
+        env:
+          RELEASE_TYPE: ${{ github.event.inputs.release_type || 'beta' }}
+        run: |
+          YEAR=$(date -u +"%Y")
+          MONTH=$(date -u +"%-m")
+          IS_BETA=$([[ "$RELEASE_TYPE" == "beta" ]] && echo "true" || echo "false")
+
+          PREFIX="v${YEAR}.${MONTH}"
+
+          if [ "$IS_BETA" == "true" ]; then
+            LATEST_BETA=$(git tag -l "${PREFIX}.*-beta.*" | sed -E "s/.*-beta\.([0-9]+)/\1/" | sort -n | tail -1)
+            if [ -z "$LATEST_BETA" ]; then
+              BETA_NUM=1
+            else
+              BETA_NUM=$((LATEST_BETA + 1))
+            fi
+            LATEST_STABLE=$(git tag -l "${PREFIX}.*" | grep -v beta | sed "s/${PREFIX}\.//" | sort -n | tail -1)
+            PATCH=${LATEST_STABLE:-0}
+            NEXT_PATCH=$((PATCH + 1))
+            VERSION="${YEAR}.${MONTH}.${NEXT_PATCH}-beta.${BETA_NUM}"
+            CHANNEL="beta"
+          else
+            LATEST_PATCH=$(git tag -l "${PREFIX}.*" | grep -v beta | sed "s/${PREFIX}\.//" | sort -n | tail -1)
+            if [ -z "$LATEST_PATCH" ]; then
+              PATCH=0
+            else
+              PATCH=$((LATEST_PATCH + 1))
+            fi
+            VERSION="${YEAR}.${MONTH}.${PATCH}"
+            CHANNEL="stable"
+          fi
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "channel=${CHANNEL}" >> $GITHUB_OUTPUT
+          echo "Version: ${VERSION} (Channel: ${CHANNEL})"
+
+  build:
+    name: Build (${{ matrix.arch }})
+    needs: calculate-version
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [arm64, amd64]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build with Docker
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          outputs: build
+          platforms: linux/${{ matrix.arch }}
+
+      - name: Install FPM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ruby-dev gcc g++
+          sudo gem install fpm
+
+      - name: Create packages
+        env:
+          VERSION: ${{ needs.calculate-version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p dist
+
+          # Create .deb package
+          fpm -s dir -t deb \
+            -n gstreamer1.0-libuvch264src \
+            -v "${VERSION}" \
+            -a "${ARCH}" \
+            --description "GStreamer plugin for UVC H264 capture" \
+            --maintainer "CERALIVE <contact@ceralive.com>" \
+            --url "https://github.com/CERALIVE/gstlibuvch264src" \
+            --license "LGPL-2.1" \
+            --depends "libgstreamer1.0-0" \
+            -p "dist/gstreamer1.0-libuvch264src_${VERSION}_${ARCH}.deb" \
+            build/usr/=/usr/
+
+          # Create .tar.gz archive
+          mkdir -p tarball/gstreamer1.0-libuvch264src-${VERSION}
+          cp -r build/usr/* tarball/gstreamer1.0-libuvch264src-${VERSION}/
+          cd tarball
+          tar -czvf ../dist/gstreamer1.0-libuvch264src_${VERSION}_${ARCH}.tar.gz gstreamer1.0-libuvch264src-${VERSION}
+          cd ..
+
+          # Create checksums
+          cd dist
+          sha256sum gstreamer1.0-libuvch264src_${VERSION}_${ARCH}.deb > gstreamer1.0-libuvch264src_${VERSION}_${ARCH}.deb.sha256
+          sha256sum gstreamer1.0-libuvch264src_${VERSION}_${ARCH}.tar.gz > gstreamer1.0-libuvch264src_${VERSION}_${ARCH}.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gstlibuvch264src-${{ matrix.arch }}
+          path: |
+            dist/*.deb
+            dist/*.tar.gz
+            dist/*.sha256
+
+  sign-and-publish:
+    name: Sign and Publish to R2
+    needs: [calculate-version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare dist directory
+        run: |
+          mkdir -p dist/arm64 dist/amd64 dist/release
+          mv artifacts/gstlibuvch264src-arm64/*.deb dist/arm64/
+          mv artifacts/gstlibuvch264src-amd64/*.deb dist/amd64/
+          cp artifacts/gstlibuvch264src-arm64/*.tar.gz dist/release/
+          cp artifacts/gstlibuvch264src-amd64/*.tar.gz dist/release/
+          cp artifacts/gstlibuvch264src-arm64/*.sha256 dist/release/
+          cp artifacts/gstlibuvch264src-amd64/*.sha256 dist/release/
+
+      - name: Import GPG key
+        run: |
+          echo "${{ secrets.DEB_SIGNING_KEY_B64 }}" | base64 -d | gpg --batch --import
+
+      - name: Install apt-utils
+        run: sudo apt-get update && sudo apt-get install -y apt-utils
+
+      - name: Generate and sign repo metadata (arm64)
+        run: |
+          cd dist/arm64
+          dpkg-scanpackages . > Packages
+          gzip -k Packages
+          apt-ftparchive release . > Release
+          gpg --batch --yes -abs -o Release.gpg Release
+          gpg --batch --yes --clearsign -o InRelease Release
+
+      - name: Generate and sign repo metadata (amd64)
+        run: |
+          cd dist/amd64
+          dpkg-scanpackages . > Packages
+          gzip -k Packages
+          apt-ftparchive release . > Release
+          gpg --batch --yes -abs -o Release.gpg Release
+          gpg --batch --yes --clearsign -o InRelease Release
+
+      - name: Install AWS CLI
+        run: |
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip -q awscliv2.zip
+          sudo ./aws/install
+
+      - name: Upload to R2
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          CHANNEL: ${{ needs.calculate-version.outputs.channel }}
+        run: |
+          aws configure set aws_access_key_id "$R2_ACCESS_KEY_ID"
+          aws configure set aws_secret_access_key "$R2_SECRET_ACCESS_KEY"
+
+          aws s3 sync dist/arm64/ "s3://$R2_BUCKET/dists/$CHANNEL/binary-arm64/" \
+            --endpoint-url "$R2_ENDPOINT"
+          aws s3 sync dist/amd64/ "s3://$R2_BUCKET/dists/$CHANNEL/binary-amd64/" \
+            --endpoint-url "$R2_ENDPOINT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.calculate-version.outputs.version }}
+          name: gstreamer1.0-libuvch264src v${{ needs.calculate-version.outputs.version }}
+          prerelease: ${{ needs.calculate-version.outputs.channel == 'beta' }}
+          files: |
+            dist/arm64/*.deb
+            dist/amd64/*.deb
+            dist/release/*.tar.gz
+            dist/release/*.sha256
+          body: |
+            ## gstreamer1.0-libuvch264src v${{ needs.calculate-version.outputs.version }}
+
+            GStreamer plugin for UVC H264 capture.
+
+            ### Debian Packages
+            | Architecture | Package |
+            |--------------|---------|
+            | ARM64 | `gstreamer1.0-libuvch264src_${{ needs.calculate-version.outputs.version }}_arm64.deb` |
+            | AMD64 | `gstreamer1.0-libuvch264src_${{ needs.calculate-version.outputs.version }}_amd64.deb` |
+
+            ### Binary Archives
+            | Architecture | Archive |
+            |--------------|---------|
+            | ARM64 | `gstreamer1.0-libuvch264src_${{ needs.calculate-version.outputs.version }}_arm64.tar.gz` |
+            | AMD64 | `gstreamer1.0-libuvch264src_${{ needs.calculate-version.outputs.version }}_amd64.tar.gz` |
+
+            ### Installation
+
+            **Debian/Ubuntu:**
+            ```bash
+            sudo dpkg -i gstreamer1.0-libuvch264src_${{ needs.calculate-version.outputs.version }}_<arch>.deb
+            ```
+
+            **Manual:**
+            ```bash
+            tar -xzf gstreamer1.0-libuvch264src_${{ needs.calculate-version.outputs.version }}_<arch>.tar.gz
+            sudo cp -r gstreamer1.0-libuvch264src-${{ needs.calculate-version.outputs.version }}/* /usr/
+            ```
