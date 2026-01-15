@@ -215,7 +215,15 @@ jobs:
           body: |
             ## gstreamer1.0-libuvch264src v${{ needs.calculate-version.outputs.version }}
 
-            GStreamer plugin for UVC H264 capture.
+            GStreamer plugin for UVC H264 capture (Elgato Cam Link, etc.).
+
+            ### Dependency Chain
+            ```
+            gstlibuvch264src (this package) ← standalone GStreamer plugin
+              ├── Depends: libgstreamer1.0-0
+              │
+              └── Used by: ceracoder → ceralive-device
+            ```
 
             ### Debian Packages
             | Architecture | Package |
