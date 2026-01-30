@@ -64,18 +64,19 @@ jobs:
           echo "Version: ${VERSION} (Channel: ${CHANNEL})"
 
   build:
-    name: Build (${{ matrix.arch }})
+    name: Build (${{ matrix.config.arch }})
     needs: calculate-version
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.config.runner }}
     strategy:
       matrix:
-        arch: [arm64, amd64]
+        config:
+          - arch: arm64
+            runner: ubuntu-24.04-arm64
+          - arch: amd64
+            runner: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -85,7 +86,7 @@ jobs:
         with:
           context: .
           outputs: build
-          platforms: linux/${{ matrix.arch }}
+          platforms: linux/${{ matrix.config.arch }}
 
       - name: Install FPM
         run: |
@@ -96,7 +97,7 @@ jobs:
       - name: Create packages
         env:
           VERSION: ${{ needs.calculate-version.outputs.version }}
-          ARCH: ${{ matrix.arch }}
+          ARCH: ${{ matrix.config.arch }}
         run: |
           mkdir -p dist
 
@@ -128,7 +129,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: gstlibuvch264src-${{ matrix.arch }}
+          name: gstlibuvch264src-${{ matrix.config.arch }}
           path: |
             dist/*.deb
             dist/*.tar.gz

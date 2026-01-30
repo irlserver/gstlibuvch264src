@@ -1,5 +1,7 @@
-# Use a ARM64 base image
-FROM --platform=linux/arm64 ubuntu:latest AS build
+# Multi-architecture support
+ARG TARGETARCH
+
+FROM ubuntu:latest AS build
 
 # Set the working directory inside the container
 WORKDIR /app
@@ -35,7 +37,10 @@ RUN meson compile
 RUN meson install --no-rebuild
 
 # --- Second Stage: Create a smaller image for just the plugin ---
-FROM --platform=linux/arm64 ubuntu:latest AS runtime
+FROM ubuntu:latest AS runtime
+
+# Multi-architecture support
+ARG TARGETARCH
 
 # Install runtime dependencies (GStreamer)
 RUN apt-get update && apt-get install -y \
@@ -44,10 +49,22 @@ RUN apt-get update && apt-get install -y \
 	libusb-1.0-0 \
 	&& rm -rf /var/lib/apt/lists/*
 
-# Create necessary directories
-RUN mkdir -p /usr/local/lib/aarch64-linux-gnu/gstreamer-1.0
-RUN mkdir -p /usr/lib/aarch64-linux-gnu
+# Set architecture-specific library path
+# TARGETARCH is "arm64" or "amd64", map to GNU triplet
+RUN GNUARCH=$(case "${TARGETARCH}" in \
+	"arm64") echo "aarch64-linux-gnu" ;; \
+	"amd64") echo "x86_64-linux-gnu" ;; \
+	*) echo "unknown-linux-gnu" ;; \
+	esac) && \
+	mkdir -p /usr/local/lib/${GNUARCH}/gstreamer-1.0 && \
+	mkdir -p /usr/lib/${GNUARCH} && \
+	echo "${GNUARCH}" > /tmp/gnuarch
 
 # Copy the built GStreamer plugin and libuvc from the build stage
-COPY --from=build /usr/local/lib/aarch64-linux-gnu/gstreamer-1.0/libgstlibuvch264src.so /usr/local/lib/aarch64-linux-gnu/gstreamer-1.0/
-COPY --from=build /usr/local/lib/libuvc.* /usr/lib/aarch64-linux-gnu/
+RUN GNUARCH=$(cat /tmp/gnuarch) && \
+	echo "Copying libraries for architecture: ${GNUARCH}"
+COPY --from=build /usr/local/lib/*/gstreamer-1.0/libgstlibuvch264src.so /tmp/plugin.so
+COPY --from=build /usr/local/lib/libuvc.* /tmp/
+RUN GNUARCH=$(cat /tmp/gnuarch) && \
+	mv /tmp/plugin.so /usr/local/lib/${GNUARCH}/gstreamer-1.0/ && \
+	mv /tmp/libuvc.* /usr/lib/${GNUARCH}/
