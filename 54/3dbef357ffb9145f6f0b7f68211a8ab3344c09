@@ -1,0 +1,23 @@
+.gitattributes
+  4ff44e5db97600c4 1-15
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "543dbef357ffb9145f6f0b7f68211a8ab3344c09",
+  "prompts": {
+    "4ff44e5db97600c4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ec590e50-b566-46cf-b152-758430c26f25",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "datagutt",
+      "messages": [],
+      "total_additions": 15,
+      "total_deletions": 0,
+      "accepted_lines": 15,
+      "overriden_lines": 0
+    }
+  }
+}
