@@ -1,0 +1,29 @@
+libuvch264src/src/gstlibuvch264src.c
+  4ff44e5db97600c4 2-5,49-55,209-214,228-456,545-546,627-635,648,663,672,674,678-683,686,690,694-728,731,734-742,744-747,752,758,764-767,830,924,964-971,975-979,984
+.github/workflows/publish-deb.yml
+  4ff44e5db97600c4 1-38
+Dockerfile
+  4ff44e5db97600c4 1-53
+libuvch264src/src/gstlibuvch264src.h
+  4ff44e5db97600c4 46-51
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "b11a18b1ceffe7450eec89b39264e913332131f4",
+  "prompts": {
+    "4ff44e5db97600c4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ec590e50-b566-46cf-b152-758430c26f25",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "datagutt",
+      "messages": [],
+      "total_additions": 862,
+      "total_deletions": 432,
+      "accepted_lines": 439,
+      "overriden_lines": 0
+    }
+  }
+}
