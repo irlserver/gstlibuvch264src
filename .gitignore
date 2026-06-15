@@ -1,0 +1,10 @@
+
+# OpenCode agent state (local only)
+.omo/
+
+# Build directories (Meson + CMake/ctest)
+/build/
+/build*/
+
+# Test artifacts (ctest output, coverage, traces)
+/test-results/

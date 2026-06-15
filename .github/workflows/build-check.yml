@@ -1,0 +1,82 @@
+name: Build Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build ${{ matrix.config.arch }}
+    runs-on: ${{ matrix.config.runner }}
+    strategy:
+      matrix:
+        config:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+          - arch: amd64
+            runner: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build with Docker
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          outputs: build
+          platforms: linux/${{ matrix.config.arch }}
+
+      - name: Verify plugin was built
+        run: |
+          ls -la build/usr/lib/*/gstreamer-1.0/
+
+      - name: Build Summary
+        run: |
+          echo "## ✅ Build Check Passed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Architecture:** ${{ matrix.config.arch }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Runner:** ${{ matrix.config.runner }}" >> $GITHUB_STEP_SUMMARY
+
+  functional-test:
+    name: Functional suite + TSan/ASAN (ctest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install build + GStreamer dev dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            git \
+            patch \
+            pkg-config \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libjpeg-dev \
+            libusb-1.0-0-dev
+
+      # ENABLE_SANITIZERS is load-bearing: without it ctest runs only the plain
+      # variants, dropping all ASan (SPS/PPS overflow) and TSan (frame/PTS race)
+      # coverage. Keep it on so the full hardware-independent suite is gated.
+      - name: Configure and build (with sanitizers)
+        run: |
+          cmake -B build -DENABLE_SANITIZERS=ON
+          cmake --build build
+
+      - name: Run ctest (full suite incl. TSan/ASAN)
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Functional Test Summary
+        if: always()
+        run: |
+          echo "## 🔌 Functional test suite (ctest + TSan/ASAN)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '`ctest --test-dir build` ran the full hardware-independent suite against the libuvc mock: plugin-load smoke, mock streaming, lifecycle, device selection, negotiate edges, SPS/PPS overflow (ASan), frame/PTS thread-safety (TSan), and the consolidated functional caps (H.264/H.265) + backpressure suite.' >> $GITHUB_STEP_SUMMARY

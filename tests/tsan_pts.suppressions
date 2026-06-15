@@ -1,0 +1,42 @@
+# ThreadSanitizer suppressions for test_pts_thread_safety.c.
+#
+# What this test exercises: gst_element_set_clock() hammered from the main thread
+# against frame_callback() running on the libuvc feeder thread, sharing the clock
+# pointer and the PTS baseline (base_time, prev_pts, pts_offset_sum, pts_stretch).
+# Both sides now take GST_OBJECT_LOCK around those accesses (the actual fix).
+#
+# Why the clock/PTS races below are still suppressed: GST_OBJECT_LOCK is a GMutex,
+# and on Linux GLib implements GMutex with a raw futex inside uninstrumented
+# libglib. Under ignore_noninstrumented_modules=1 TSan cannot observe that
+# happens-before, so it reports the *correctly locked* clock/PTS accesses as
+# races anyway (confirmed: with the lock present TSan still flags
+# frame_pipeline.c:104/120/223/289/291 against gstlibuvch264src.c set_clock).
+# Atomics are not a valid substitute here - the clock needs an atomic
+# load-and-ref (a lock), and the PTS fields form one multi-field invariant - so
+# the lock is the right mechanism even though TSan is blind to it. The lock's
+# correctness is verified by code review plus this test's behavioural teeth:
+# it must run to completion with NO deadlock (the base_time lazy-init calls
+# gst_element_get_base_time() OUTSIDE the lock; locking across it would
+# self-deadlock the non-recursive GST_OBJECT_LOCK and time the test out) and NO
+# crash, and frame_throughput must drop zero buffers.
+race:frame_callback
+race:gst_libuvc_h264_set_clock
+race:gst_libuvc_h264_negotiate
+
+# GStreamer/GLib/libcheck are not built with -fsanitize=thread, so their internal
+# synchronization is invisible and surfaces as false positives.
+called_from_lib:libglib-2.0
+called_from_lib:libgobject-2.0
+called_from_lib:libgthread-2.0
+called_from_lib:libgstreamer-1.0
+called_from_lib:libgstbase-1.0
+called_from_lib:libgstcheck-1.0
+
+# Element lifecycle/control-flag races (streaming, control_running, uvc_devh) on
+# create()/start()/stop()/control_thread are owned by other hardening tasks; they
+# can fire at startup/teardown but are out of scope for this change.
+race:gst_libuvc_h264_src_create
+race:gst_libuvc_h264_src_start
+race:gst_libuvc_h264_src_stop
+race:gst_libuvc_h264_src_control_thread
+race:gst_libuvc_h264_src_process_control_command

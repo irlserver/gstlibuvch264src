@@ -20,39 +20,8 @@ G_DECLARE_FINAL_TYPE(GstLibuvcH264Src, gst_libuvc_h264_src, GST, LIBUVC_H264_SRC
 
 #define MIN_FRAMES_CALC_INTERVAL 60
 
-struct _GstLibuvcH264Src {
-  GstPushSrc parent_instance;
-  gchar* index;
-  uvc_context_t *uvc_ctx;
-  uvc_device_t *uvc_dev;
-  uvc_device_handle_t *uvc_devh;
-  uvc_stream_ctrl_t uvc_ctrl;
-  enum uvc_frame_format frame_format;
-  GAsyncQueue *frame_queue;
-  gboolean streaming;
-  GstClock *clock;
-  int64_t pts_offset_sum;
-  int64_t pts_stretch;
-  GstClockTime base_time;
-  GstClockTime prev_pts;
-  gint64 frame_interval; // in ns
-  guint64 prev_int_ts;
-  gint frame_count;
-  gboolean had_idr;
-  gboolean send_sps_pps;
-  gint vps_length;
-  gint sps_length;
-  gint pps_length;
-  unsigned char vps[SPSPPSBUFSZ];
-  unsigned char sps[SPSPPSBUFSZ];
-  unsigned char pps[SPSPPSBUFSZ];
-  
-  // Control socket additions
-  gint control_socket;
-  gpointer control_thread;
-  gboolean control_running;
-  GMutex control_mutex;
-};
+/* The instance struct (struct _GstLibuvcH264Src) is defined in the private
+ * gstlibuvch264src_internal.h, shared by the element's translation units. */
 
 G_END_DECLS
 
