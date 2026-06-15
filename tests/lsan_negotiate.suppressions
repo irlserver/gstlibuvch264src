@@ -1,0 +1,27 @@
+# LeakSanitizer suppressions for the negotiate leak test (Task 13).
+#
+# The test wraps pipeline construction + warm-up in __lsan_disable()/enable() so
+# the recoverable check sees only allocations made during the measured
+# renegotiation window. These entries cover the few one-time GStreamer/GLib
+# initialisations that happen BEFORE that window (gst_init in the gst-check main,
+# element type registration in the fixture) and that LSAN reports as leaked
+# because they are reachable only through interior pointers or global tables.
+#
+# None of these frames appear in negotiate()'s GstCaps allocation stacks
+# (gst_pad_query_caps / gst_caps_intersect under gst_libuvc_h264_negotiate), so
+# the M3 caps leak is still reported and the test keeps its teeth.
+
+leak:g_type_register_static
+leak:g_type_register_fundamental
+leak:g_type_add_interface_static
+leak:g_type_class_ref
+leak:type_node_any_new_W
+leak:g_quark_from
+leak:g_intern_string
+leak:g_intern_static_string
+leak:gst_init
+leak:_priv_gst_
+leak:gst_registry
+leak:gst_plugin
+leak:gst_element_register
+leak:gst_element_factory

@@ -1,37 +1,43 @@
-#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <fcntl.h>
-#include <sys/select.h>
 #include <unistd.h>
-#include <libusb-1.0/libusb.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <limits.h>
 #include "gstlibuvch264src.h"
+#include "gstlibuvch264src_internal.h"
+#include "gstlibuvch264src_error.h"
+#include "uvc_device.h"
+#include "frame_pipeline.h"
+#include "spspps_cache.h"
+#include "ptz_control.h"
 #include <gst/gst.h>
 #include <libuvc/libuvc.h>
 
-GST_DEBUG_CATEGORY_STATIC(gst_libuvc_h264_src_debug);
-#define GST_CAT_DEFAULT gst_libuvc_h264_src_debug
-
-typedef enum {
-    UNIT_INVALID,
-    UNIT_FRAME_IDR,
-    UNIT_FRAME_NON_IDR,
-    UNIT_VPS,
-    UNIT_SPS,
-    UNIT_PPS,
-} nal_unit_type_t;
+GST_DEBUG_CATEGORY(gst_libuvc_h264_src_debug);
 
 enum {
   PROP_0,
   PROP_INDEX,
+  PROP_PAN,
+  PROP_TILT,
+  PROP_ZOOM,
+  PROP_CONTROL_SOCKET,
+  PROP_CONTROL_SOCKET_PATH,
+  PROP_RECONNECT,
   PROP_LAST
 };
 
-typedef struct {
-    nal_unit_type_t type;
-    unsigned char *ptr;
-    int len;
-} nal_unit_t;
+/* Sustained-silence disconnect detection. libuvc delivers no NULL frame on
+ * unplug in callback mode (Task 4 spike), so create() infers a disconnect after
+ * this many consecutive TIMEOUT_DURATION (1 s) pop timeouts with no frame. */
+#define DISCONNECT_TIMEOUT_COUNT 5
+
+/* Opt-in in-element reconnect: bounded exponential backoff 1,2,4,8,16 s. */
+#define RECONNECT_MAX_RETRIES 5
+#define RECONNECT_BACKOFF_INITIAL_S 1
 
 #define H264_CAPS "video/x-h264," \
                   "stream-format=(string)byte-stream," \
@@ -51,6 +57,7 @@ G_DEFINE_TYPE_WITH_CODE(GstLibuvcH264Src, gst_libuvc_h264_src, GST_TYPE_PUSH_SRC
   GST_DEBUG_CATEGORY_INIT(gst_libuvc_h264_src_debug, "libuvch264src", 0, "libuvch264src element"));
 
 static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc);
+static gboolean gst_libuvc_h264_src_query(GstBaseSrc *basesrc, GstQuery *query);
 static void gst_libuvc_h264_src_set_property(GObject *object, guint prop_id,
                                              const GValue *value, GParamSpec *pspec);
 static void gst_libuvc_h264_src_get_property(GObject *object, guint prop_id,
@@ -58,15 +65,18 @@ static void gst_libuvc_h264_src_get_property(GObject *object, guint prop_id,
 static gboolean gst_libuvc_h264_set_clock(GstElement *element, GstClock *clock);
 static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src);
 static gboolean gst_libuvc_h264_src_stop(GstBaseSrc *src);
+static gboolean gst_libuvc_h264_src_unlock(GstBaseSrc *src);
+static gboolean gst_libuvc_h264_src_unlock_stop(GstBaseSrc *src);
 static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf);
 static void gst_libuvc_h264_src_finalize(GObject *object);
+static gboolean gst_libuvc_h264_src_set_ptz(GstLibuvcH264Src *self,
+                                            gint pan, gint tilt, gint zoom);
 
-// Forward declarations for control functions
-static gpointer gst_libuvc_h264_src_control_thread(gpointer data);
-static char* gst_libuvc_h264_src_process_control_command(GstLibuvcH264Src *self, const char *command);
-
-// USB device management functions
-static void gst_libuvc_h264_src_force_usb_release(GstLibuvcH264Src *self);
+/* GAsyncQueue forbids NULL payloads, so create() can never receive a NULL
+ * "no more frames" marker. unlock() instead pushes this dedicated address to
+ * wake a blocked create(); its value is irrelevant, only its identity matters. */
+static const gchar flush_sentinel = 0;
+#define FLUSH_SENTINEL ((gpointer) &flush_sentinel)
 
 static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
   GObjectClass *gobject_class = G_OBJECT_CLASS(klass);
@@ -75,12 +85,59 @@ static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
   GstPushSrcClass *push_src_class = GST_PUSH_SRC_CLASS(klass);
 
   base_src_class->negotiate = GST_DEBUG_FUNCPTR(gst_libuvc_h264_negotiate);
+  base_src_class->query = GST_DEBUG_FUNCPTR(gst_libuvc_h264_src_query);
   gobject_class->set_property = gst_libuvc_h264_src_set_property;
   gobject_class->get_property = gst_libuvc_h264_src_get_property;
 
   g_object_class_install_property(gobject_class, PROP_INDEX,
-    g_param_spec_string("index", "Index", "Device location, e.g., '0'",
+    g_param_spec_string("index", "Index",
+                        "Device selector: ordinal \"0\", \"vid:pid\" (hex, e.g. "
+                        "\"1234:5678\"), \"serial:<sn>\", or \"bus:<bus>:<addr>\"",
                         DEFAULT_DEVICE_INDEX, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /* Native PTZ properties. Param-spec bounds cover the UVC arcsecond / focal
+   * domain; the real per-device range is enforced at set time, and a set on an
+   * axis the device does not report is silently ignored (capability-gated). */
+  g_object_class_install_property(gobject_class, PROP_PAN,
+    g_param_spec_int("pan", "Pan", "Absolute pan position in UVC arcseconds",
+                     -648000, 648000, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property(gobject_class, PROP_TILT,
+    g_param_spec_int("tilt", "Tilt", "Absolute tilt position in UVC arcseconds",
+                     -648000, 648000, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property(gobject_class, PROP_ZOOM,
+    g_param_spec_int("zoom", "Zoom", "Absolute zoom as a UVC focal length",
+                     0, 65535, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /* Opt-in PTZ control socket (M9). Default OFF: the legacy world-accessible
+   * /tmp/libuvc_control is gone, so nothing binds unless asked. */
+  g_object_class_install_property(gobject_class, PROP_CONTROL_SOCKET,
+    g_param_spec_boolean("control-socket", "Control socket",
+                         "Enable the Unix-domain PTZ control socket",
+                         FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property(gobject_class, PROP_CONTROL_SOCKET_PATH,
+    g_param_spec_string("control-socket-path", "Control socket path",
+                        "Explicit control socket path; empty selects a "
+                        "per-instance path under $XDG_RUNTIME_DIR",
+                        NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /* Opt-in in-element auto-reconnect (Task 18). Default OFF: a mid-stream
+   * disconnect always posts a RESOURCE/READ error; only with this enabled does
+   * the element first attempt a bounded-backoff teardown/reopen before erroring. */
+  g_object_class_install_property(gobject_class, PROP_RECONNECT,
+    g_param_spec_boolean("reconnect", "Reconnect",
+                         "Attempt bounded in-element auto-reconnect when the "
+                         "device disconnects mid-stream",
+                         FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /* Action signal driving all three axes in one emission; each axis is applied
+   * only when the device supports it (gated in ptz_control.c). */
+  g_signal_new_class_handler("set-ptz", G_TYPE_FROM_CLASS(klass),
+    G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
+    G_CALLBACK(gst_libuvc_h264_src_set_ptz), NULL, NULL, NULL,
+    G_TYPE_BOOLEAN, 3, G_TYPE_INT, G_TYPE_INT, G_TYPE_INT);
 
   gst_element_class_set_static_metadata(element_class,
     "UVC H.264 / H.265 Video Source", "Source/Video",
@@ -92,176 +149,10 @@ static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
   element_class->set_clock = gst_libuvc_h264_set_clock;
   base_src_class->start = gst_libuvc_h264_src_start;
   base_src_class->stop = gst_libuvc_h264_src_stop;
+  base_src_class->unlock = gst_libuvc_h264_src_unlock;
+  base_src_class->unlock_stop = gst_libuvc_h264_src_unlock_stop;
   push_src_class->create = gst_libuvc_h264_src_create;
   gobject_class->finalize = gst_libuvc_h264_src_finalize;
-}
-
-#define DIRBUFLEN 4096
-__thread char dir_buf[DIRBUFLEN];
-char *get_spspps_path(GstLibuvcH264Src *self, char *index) {
-    const char *home_dir = getenv("HOME");
-    if (home_dir == NULL) {
-        GST_WARNING_OBJECT(self, "Warning: HOME environment variable not set.");
-        home_dir = "";
-    }
-
-	int ret = snprintf(dir_buf, DIRBUFLEN, "%s/.spspps%s%s%s",
-	                   home_dir,
-	                   index ? "/" : "",
-	                   index ? index : "",
-	                   (index && self->frame_format == UVC_FRAME_FORMAT_H265) ? ".h265" : "");
-	if (ret >= DIRBUFLEN) {
-	    GST_ERROR_OBJECT(self, "Error building SPS/PPS path\n");
-	    return NULL;
-	}
-
-	return dir_buf;
-}
-
-void create_hidden_directory(GstLibuvcH264Src *self) {
-    char *hidden_dir = get_spspps_path(self, NULL);
-
-    struct stat st;
-    if (stat(hidden_dir, &st) == -1) {
-        if (mkdir(hidden_dir, 0700) != 0)
-            GST_ERROR_OBJECT(self, "Error creating directory %s\n", hidden_dir);
-        else
-            GST_WARNING_OBJECT(self, "Directory %s created successfully.\n", hidden_dir);
-    } else if (!S_ISDIR(st.st_mode))
-        GST_WARNING_OBJECT(self, "Warning: %s exists but is not a directory.\n", hidden_dir);
-}
-
-FILE *open_spspps_file(GstLibuvcH264Src *self, char mode) {
-    if (mode == 'w' || mode == 'a') {
-        create_hidden_directory(self);
-    }
-
-    char m[3];
-    sprintf(m, "%cb", mode);
-    char *file_name = get_spspps_path(self, self->index);
-    FILE *fp = fopen(file_name, m);
-    return fp;
-}
-
-nal_unit_type_t convert_unit_type(enum uvc_frame_format format, int type) {
-    if (format == UVC_FRAME_FORMAT_H264) {
-        switch (type) {
-            case 1:
-                return UNIT_FRAME_NON_IDR;
-            case 5:
-                return UNIT_FRAME_IDR;
-            case 7:
-                return UNIT_SPS;
-            case 8:
-                return UNIT_PPS;
-      }
-
-    } else if (format == UVC_FRAME_FORMAT_H265) {
-        switch (type) {
-            case 1:
-                return UNIT_FRAME_NON_IDR;
-            case 20:
-                return UNIT_FRAME_IDR;
-            case 32:
-                return UNIT_VPS;
-            case 33:
-                return UNIT_SPS;
-            case 34:
-                return UNIT_PPS;
-        }
-    }
-
-    return UNIT_INVALID;
-}
-
-int find_nal_unit(enum uvc_frame_format format,
-                  unsigned char *buf, int buflen, int start, int search, int *offset) {
-    if (format != UVC_FRAME_FORMAT_H264 && format != UVC_FRAME_FORMAT_H265) return -1;
-    if (buflen < (start + 5)) return -1;
-
-    int i = start;
-    do {
-        if (buf[i] == 0 && buf[i+1] == 0 && buf[i+2] == 0 && buf[i+3] == 1) {
-            if (offset) *offset = i;
-            if (format == UVC_FRAME_FORMAT_H264) {
-              return convert_unit_type(format, buf[i+4] & 0x1F);
-            } else if (format == UVC_FRAME_FORMAT_H265) {
-              return convert_unit_type(format, (buf[i+4] >> 1) & 0x3F);
-            }
-        }
-        i++;
-    } while (search && i < (buflen - 4));
-
-    return -1;
-}
-
-int parse_nal_units(enum uvc_frame_format format,
-                    nal_unit_t *units, int max, unsigned char *buf, int buflen) {
-    int i = 0;
-
-    int nal_offset = 0;
-    int next_type = find_nal_unit(format, buf, buflen, 0, 0, &nal_offset);
-    while (next_type >= 0 && i < max) {
-        int type = next_type;
-        int start = nal_offset;
-        next_type = find_nal_unit(format, buf, buflen, nal_offset + 5, 1, &nal_offset);
-        int end = (next_type >= 0) ? nal_offset : buflen;
-        int length = end - start;
-
-        units[i].type = type;
-        units[i].len = length;
-        units[i].ptr = &buf[start];
-
-        i++;
-    }
-
-    return i;
-}
-
-// Must only be called after the caps have been negotiated and the format is known
-void load_spspps(GstLibuvcH264Src *self) {
-    FILE* fp = open_spspps_file(self, 'r');
-    if (fp) {
-        unsigned char buf[SPSPPSBUFSZ*3];
-        gint read_bytes = fread(buf, 1, sizeof(buf), fp);
-        fclose(fp);
-
-        #define MAX_UNITS_LOAD 3
-        nal_unit_t units[MAX_UNITS_LOAD];
-        int c = parse_nal_units(self->frame_format, units, MAX_UNITS_LOAD, buf, read_bytes);
-
-        for (int i = 0; i < c; i++) {
-            switch (units[i].type) {
-                case UNIT_VPS:
-                    memcpy(self->vps, units[i].ptr, units[i].len);
-                    self->vps_length = units[i].len;
-                    break;
-                case UNIT_SPS:
-                    memcpy(self->sps, units[i].ptr, units[i].len);
-                    self->sps_length = units[i].len;
-                    break;
-                case UNIT_PPS:
-                    memcpy(self->pps, units[i].ptr, units[i].len);
-                    self->pps_length = units[i].len;
-                    break;
-                default:
-                    // We shouldn't have other types; but ignore them if we do
-                    break;
-            }
-        }
-    }
-}
-
-void store_spspps(GstLibuvcH264Src *self) {
-    FILE* fp = open_spspps_file(self, 'w');
-	if (fp) {
-		if (self->frame_format == UVC_FRAME_FORMAT_H265) {
-			fwrite(self->vps, 1, self->vps_length, fp);
-		}
-		fwrite(self->sps, 1, self->sps_length, fp);
-		fwrite(self->pps, 1, self->pps_length, fp);
-		fclose(fp);
-	}
 }
 
 static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
@@ -272,10 +163,16 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->clock = NULL;
   self->frame_queue = g_async_queue_new();
   self->streaming = FALSE;
+  self->flushing = 0;
+  self->consecutive_timeouts = 0;
+  self->reconnect_enabled = FALSE;
+  self->frame_offset = 0;
   self->base_time = G_MAXUINT64;
   self->prev_pts = G_MAXUINT64;
   
   // Control socket initialization
+  self->control_socket_enabled = FALSE;
+  self->control_socket_path = NULL;
   self->control_socket = -1;
   self->control_thread = NULL;
   self->control_running = FALSE;
@@ -291,242 +188,6 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
 
   gst_base_src_set_live(GST_BASE_SRC(self), TRUE);
   gst_base_src_set_format(GST_BASE_SRC(self), GST_FORMAT_TIME);
-}
-
-// Force USB device release by directly accessing libusb
-static void gst_libuvc_h264_src_force_usb_release(GstLibuvcH264Src *self) {
-    GST_DEBUG_OBJECT(self, "Forcing USB device release");
-    
-    if (!self->uvc_devh) return;
-    
-    // Get the underlying libusb handle
-    struct libusb_device_handle *usb_devh = uvc_get_libusb_handle(self->uvc_devh);
-    if (!usb_devh) {
-        GST_WARNING_OBJECT(self, "Cannot get libusb handle from uvc");
-        return;
-    }
-    
-    // Get USB device info
-    struct libusb_device *usb_dev = libusb_get_device(usb_devh);
-    if (!usb_dev) {
-        GST_WARNING_OBJECT(self, "Cannot get libusb device");
-        return;
-    }
-    
-    int bus = libusb_get_bus_number(usb_dev);
-    int addr = libusb_get_device_address(usb_dev);
-    GST_INFO_OBJECT(self, "USB device at bus %d, address %d", bus, addr);
-    
-    // Try to release all interfaces
-    for (int interface = 0; interface < 8; interface++) {
-        int ret = libusb_release_interface(usb_devh, interface);
-        if (ret == LIBUSB_SUCCESS) {
-            GST_DEBUG_OBJECT(self, "Released interface %d", interface);
-        } else if (ret == LIBUSB_ERROR_NOT_FOUND) {
-            // Interface doesn't exist, that's fine
-            break;
-        }
-    }
-    
-    // Try kernel detach if needed
-    #ifdef LIBUSB_OPTION_DETACH_KERNEL_DRIVER
-    for (int interface = 0; interface < 8; interface++) {
-        if (libusb_kernel_driver_active(usb_devh, interface) == 1) {
-            GST_DEBUG_OBJECT(self, "Detaching kernel driver from interface %d", interface);
-            libusb_detach_kernel_driver(usb_devh, interface);
-        }
-    }
-    #endif
-    
-    // Force close the libusb handle
-    GST_DEBUG_OBJECT(self, "Force closing libusb handle");
-    libusb_close(usb_devh);
-    
-    // Reset the device if possible (requires newer libusb)
-    #ifdef LIBUSB_HAS_GET_DEVICE
-    // This forces a USB port reset
-    libusb_reset_device(usb_devh);
-    #endif
-    
-    // Clear the uvc handle pointer since we've closed it
-    // Note: uvc_close() will fail if we call it now, but that's OK
-}
-
-// Control socket thread function
-static gpointer gst_libuvc_h264_src_control_thread(gpointer data) {
-    GstLibuvcH264Src *self = (GstLibuvcH264Src *)data;
-    struct sockaddr_un addr;
-    int client_fd;
-    char buffer[256];
-    fd_set read_fds;
-    struct timeval timeout;
-    
-    self->control_socket = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (self->control_socket < 0) {
-        GST_ERROR_OBJECT(self, "Failed to create control socket");
-        return NULL;
-    }
-    
-    int flags = fcntl(self->control_socket, F_GETFL, 0);
-    fcntl(self->control_socket, F_SETFL, flags | O_NONBLOCK);
-    
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strcpy(addr.sun_path, "/tmp/libuvc_control");
-    
-    unlink(addr.sun_path);
-    
-    if (bind(self->control_socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        GST_ERROR_OBJECT(self, "Failed to bind control socket");
-        close(self->control_socket);
-        self->control_socket = -1;
-        return NULL;
-    }
-    
-    if (listen(self->control_socket, 5) < 0) {
-        GST_ERROR_OBJECT(self, "Failed to listen on control socket");
-        close(self->control_socket);
-        self->control_socket = -1;
-        return NULL;
-    }
-    
-    GST_INFO_OBJECT(self, "Control socket listening on /tmp/libuvc_control");
-    
-    while (self->control_running) {
-        FD_ZERO(&read_fds);
-        FD_SET(self->control_socket, &read_fds);
-        
-        timeout.tv_sec = 1;
-        timeout.tv_usec = 0;
-        
-        int result = select(self->control_socket + 1, &read_fds, NULL, NULL, &timeout);
-        
-        if (result > 0 && FD_ISSET(self->control_socket, &read_fds)) {
-            client_fd = accept(self->control_socket, NULL, NULL);
-            if (client_fd > 0) {
-                ssize_t len = read(client_fd, buffer, sizeof(buffer)-1);
-                if (len > 0) {
-                    buffer[len] = 0;
-                    GST_INFO_OBJECT(self, "Received control command: %s", buffer);
-                    char *response = gst_libuvc_h264_src_process_control_command(self, buffer);
-                    if (response) {
-                        if (write(client_fd, response, strlen(response)) < 0) {
-                            GST_WARNING_OBJECT(self, "Failed to write response to control socket");
-                        }
-                        g_free(response);
-                    } else {
-                        const char *default_response = "OK";
-                        if (write(client_fd, default_response, strlen(default_response)) < 0) {
-                            GST_WARNING_OBJECT(self, "Failed to write default response to control socket");
-                        }
-                    }
-                }
-                close(client_fd);
-            }
-        } else if (result == 0) {
-            continue;
-        } else {
-            if (self->control_running) {
-                GST_WARNING_OBJECT(self, "Select error in control thread");
-            }
-            break;
-        }
-    }
-    
-    GST_DEBUG_OBJECT(self, "Control thread exiting");
-    return NULL;
-}
-
-static char* gst_libuvc_h264_src_process_control_command(GstLibuvcH264Src *self, const char *command) {
-    int pan, tilt, zoom;
-    uint16_t zoom_abs;
-    
-    g_mutex_lock(&self->control_mutex);
-    
-    if (sscanf(command, "PAN_TILT %d %d", &pan, &tilt) == 2) {
-        if (self->uvc_devh) {
-            uvc_error_t res = uvc_set_pantilt_abs(self->uvc_devh, pan, tilt);
-            if (res == UVC_SUCCESS) {
-                GST_INFO_OBJECT(self, "Set pan/tilt to: %d/%d", pan, tilt);
-                g_mutex_unlock(&self->control_mutex);
-                return g_strdup_printf("OK pan=%d tilt=%d", pan, tilt);
-            } else {
-                GST_WARNING_OBJECT(self, "Failed to set pan/tilt: %s", uvc_strerror(res));
-                g_mutex_unlock(&self->control_mutex);
-                return g_strdup_printf("ERROR: %s", uvc_strerror(res));
-            }
-        }
-    } 
-    else if (sscanf(command, "ZOOM %d", &zoom) == 1) {
-        if (self->uvc_devh) {
-            zoom_abs = (uint16_t)zoom;
-            uvc_error_t res = uvc_set_zoom_abs(self->uvc_devh, zoom_abs);
-            if (res == UVC_SUCCESS) {
-                GST_INFO_OBJECT(self, "Set zoom to: %d", zoom_abs);
-                g_mutex_unlock(&self->control_mutex);
-                return g_strdup_printf("OK zoom=%d", zoom_abs);
-            } else {
-                GST_WARNING_OBJECT(self, "Failed to set zoom: %s", uvc_strerror(res));
-                g_mutex_unlock(&self->control_mutex);
-                return g_strdup_printf("ERROR: %s", uvc_strerror(res));
-            }
-        }
-    }
-    else if (strcmp(command, "GET_POSITION") == 0) {
-        if (self->uvc_devh) {
-            int32_t current_pan, current_tilt;
-            uint16_t current_zoom;
-            char *response = NULL;
-            
-            uvc_error_t res_pan = uvc_get_pantilt_abs(self->uvc_devh, &current_pan, &current_tilt, UVC_GET_CUR);
-            uvc_error_t res_zoom = uvc_get_zoom_abs(self->uvc_devh, &current_zoom, UVC_GET_CUR);
-            
-            if (res_pan == UVC_SUCCESS && res_zoom == UVC_SUCCESS) {
-                response = g_strdup_printf("OK pan=%d tilt=%d zoom=%d", current_pan, current_tilt, current_zoom);
-            } else if (res_pan == UVC_SUCCESS) {
-                response = g_strdup_printf("OK pan=%d tilt=%d zoom=unknown", current_pan, current_tilt);
-            } else if (res_zoom == UVC_SUCCESS) {
-                response = g_strdup_printf("OK pan=unknown tilt=unknown zoom=%d", current_zoom);
-            } else {
-                response = g_strdup("ERROR: Cannot read position");
-            }
-            
-            GST_INFO_OBJECT(self, "Current position: pan=%d, tilt=%d, zoom=%d", 
-                           current_pan, current_tilt, current_zoom);
-            g_mutex_unlock(&self->control_mutex);
-            return response;
-        }
-    }
-    else if (strcmp(command, "GET_CAPABILITIES") == 0) {
-        if (self->uvc_devh) {
-            GString *caps = g_string_new("CAPABILITIES:");
-            
-            int32_t pan_min, pan_max, pan_step;
-            int32_t tilt_min, tilt_max, tilt_step;
-            uvc_error_t res_pt = uvc_get_pantilt_abs(self->uvc_devh, &pan_min, &tilt_min, UVC_GET_MIN);
-            if (res_pt == UVC_SUCCESS) {
-                uvc_get_pantilt_abs(self->uvc_devh, &pan_max, &tilt_max, UVC_GET_MAX);
-                uvc_get_pantilt_abs(self->uvc_devh, &pan_step, &tilt_step, UVC_GET_RES);
-                g_string_append_printf(caps, " pan=[%d,%d,step=%d] tilt=[%d,%d,step=%d]", 
-                                      pan_min, pan_max, pan_step, tilt_min, tilt_max, tilt_step);
-            }
-            
-            uint16_t zoom_min, zoom_max, zoom_step;
-            uvc_error_t res_zoom = uvc_get_zoom_abs(self->uvc_devh, &zoom_min, UVC_GET_MIN);
-            if (res_zoom == UVC_SUCCESS) {
-                uvc_get_zoom_abs(self->uvc_devh, &zoom_max, UVC_GET_MAX);
-                uvc_get_zoom_abs(self->uvc_devh, &zoom_step, UVC_GET_RES);
-                g_string_append_printf(caps, " zoom=[%d,%d,step=%d]", zoom_min, zoom_max, zoom_step);
-            }
-            
-            GST_INFO_OBJECT(self, "Capabilities: %s", caps->str);
-            g_mutex_unlock(&self->control_mutex);
-            return g_string_free(caps, FALSE);
-        }
-    }
-    
-    g_mutex_unlock(&self->control_mutex);
-    return g_strdup("ERROR: Unknown command");
 }
 
 static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
@@ -551,6 +212,8 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
 
     gint width = -1, height = -1, framerate = -1;
     GstCaps *best_caps = NULL;
+    gboolean result = FALSE;
+    gboolean found_codec_format = FALSE;
 
     // Enumerate supported H264 / H265 resolutions and framerates
     // And select the highest compatible resolution, at the highest supported framerate
@@ -561,6 +224,7 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
         gboolean is_h265 = (memcmp(format_desc->fourccFormat, "H265", 4) == 0);
 
         if (!is_h264 && !is_h265) continue;
+        found_codec_format = TRUE;
 
         GstCaps *tmp_caps = gst_caps_from_string(is_h264? H264_CAPS : H265_CAPS);
         GstStructure *tmp_structure = gst_caps_get_structure(tmp_caps, 0);
@@ -590,10 +254,23 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
                     g_value_init(&fps, GST_TYPE_FRACTION);
                     gst_value_set_fraction(&fps, (gint)_fps, 1);
                     gst_value_list_append_value(&framerates, &fps);
+                    g_value_unset(&fps);
                 }
 
+                // gst_structure_set_value() copies the list, so the local GValue
+                // owns a GST_TYPE_LIST that must be released or it leaks per call.
                 gst_structure_set_value(tmp_structure, "framerate", &framerates);
+                g_value_unset(&framerates);
             } else {
+                // A device that reports a zero frame interval would divide by
+                // zero here (SIGFPE); skip such a degenerate descriptor instead.
+                if (frame_desc->dwMinFrameInterval == 0 ||
+                    frame_desc->dwMaxFrameInterval == 0) {
+                    GST_WARNING_OBJECT(self,
+                        "Skipping %ux%u: device reported a zero frame interval",
+                        frame_desc->wWidth, frame_desc->wHeight);
+                    continue;
+                }
                 gint fps_min = 1e7 / frame_desc->dwMaxFrameInterval;
                 gint fps = 1e7 / frame_desc->dwMinFrameInterval;
                 gst_structure_set(tmp_structure, "framerate", GST_TYPE_FRACTION_RANGE, fps_min, 1, fps, 1, NULL);
@@ -624,19 +301,41 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
         gst_caps_unref(tmp_caps);
     } // for format_desc
 
-    if (width < 0 || height < 0 || framerate < 0 || !best_caps) {
-        GST_ERROR_OBJECT(self, "Unable to negotiate common caps\n");
-        return FALSE;
+    if (!found_codec_format) {
+        // The device exposes no H264/H265 format descriptor at all, so there is
+        // nothing to stream. Post a bus ERROR (not just a debug log) so
+        // downstream consumers can react, instead of falling
+        // through with uninitialized width/height/framerate.
+        gst_libuvc_h264_src_post_error(GST_ELEMENT(self), UVC_ERROR_NOT_SUPPORTED,
+            "negotiating caps: device exposes no H264/H265 format");
+        goto out;
+    }
+
+    // framerate <= 0 (not just < 0): a device whose fastest interval rounds down
+    // to 0 fps would otherwise divide by zero at the frame_interval computation.
+    if (width < 0 || height < 0 || framerate <= 0 || !best_caps) {
+        GST_ERROR_OBJECT(self, "Unable to negotiate common caps");
+        goto out;
     }
 
     int res = uvc_get_stream_ctrl_format_size(self->uvc_devh, &self->uvc_ctrl,
                                               self->frame_format, width, height, framerate);
     if (res < 0) {
         GST_ERROR_OBJECT(self, "Unable to get stream control: %s", uvc_strerror(res));
-        return FALSE;
+        goto out;
     }
 
+    GST_OBJECT_LOCK(self);
     self->frame_interval = (1000L * 1000L * 1000L) / framerate;
+    GST_OBJECT_UNLOCK(self);
+
+    /* Persist the negotiated resolution so the SPS/PPS cache key (L5) reflects
+     * the active format; load_spspps/store_spspps read these. The framerate is
+     * also kept so the opt-in reconnect path can re-run
+     * uvc_get_stream_ctrl_format_size() with the original geometry. */
+    self->negotiated_width = width;
+    self->negotiated_height = height;
+    self->negotiated_framerate = framerate;
 
     gst_base_src_set_caps(basesrc, best_caps);
 
@@ -644,7 +343,42 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
 
     load_spspps(self);
 
-    return TRUE;
+    result = TRUE;
+
+out:
+    // Single cleanup path: the working caps and the chosen caps are owned locals.
+    // gst_base_src_set_caps() takes its own reference, so best_caps must be freed
+    // here on success too, and both must be freed on every error path.
+    if (caps)
+        gst_caps_unref(caps);
+    if (best_caps)
+        gst_caps_unref(best_caps);
+    return result;
+}
+
+static gboolean gst_libuvc_h264_src_query(GstBaseSrc *basesrc, GstQuery *query) {
+  GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(basesrc);
+
+  if (GST_QUERY_TYPE(query) == GST_QUERY_LATENCY) {
+    /* A live source delivers a frame only once it has been fully captured, so
+       the minimum latency is one frame interval; report it explicitly rather
+       than leaving downstream sinks with the GstBaseSrc default of zero. max ==
+       min: the element does not buffer ahead. frame_interval is shared with the
+       frame_callback PTS estimator, which mutates it under the object lock, so
+       read it the same way; until negotiate() sets it, defer to the base class. */
+    GstClockTime latency;
+    GST_OBJECT_LOCK(self);
+    latency = self->frame_interval > 0
+              ? (GstClockTime) self->frame_interval : GST_CLOCK_TIME_NONE;
+    GST_OBJECT_UNLOCK(self);
+
+    if (GST_CLOCK_TIME_IS_VALID(latency)) {
+      gst_query_set_latency(query, TRUE, latency, latency);
+      return TRUE;
+    }
+  }
+
+  return GST_BASE_SRC_CLASS(gst_libuvc_h264_src_parent_class)->query(basesrc, query);
 }
 
 static void gst_libuvc_h264_src_set_property(GObject *object, guint prop_id,
@@ -655,6 +389,27 @@ static void gst_libuvc_h264_src_set_property(GObject *object, guint prop_id,
     case PROP_INDEX:
       g_free(self->index);
       self->index = g_value_dup_string(value);
+      break;
+    case PROP_PAN:
+      gst_libuvc_h264_src_ptz_set_pan(self, g_value_get_int(value));
+      break;
+    case PROP_TILT:
+      gst_libuvc_h264_src_ptz_set_tilt(self, g_value_get_int(value));
+      break;
+    case PROP_ZOOM:
+      gst_libuvc_h264_src_ptz_set_zoom(self, g_value_get_int(value));
+      break;
+    case PROP_CONTROL_SOCKET:
+      self->control_socket_enabled = g_value_get_boolean(value);
+      break;
+    case PROP_CONTROL_SOCKET_PATH: {
+      const gchar *path = g_value_get_string(value);
+      g_free(self->control_socket_path);
+      self->control_socket_path = (path && *path) ? g_strdup(path) : NULL;
+      break;
+    }
+    case PROP_RECONNECT:
+      self->reconnect_enabled = g_value_get_boolean(value);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
@@ -670,10 +425,52 @@ static void gst_libuvc_h264_src_get_property(GObject *object, guint prop_id,
     case PROP_INDEX:
       g_value_set_string(value, self->index);
       break;
+    case PROP_PAN:
+      g_value_set_int(value, self->pan_cur);
+      break;
+    case PROP_TILT:
+      g_value_set_int(value, self->tilt_cur);
+      break;
+    case PROP_ZOOM:
+      g_value_set_int(value, self->zoom_cur);
+      break;
+    case PROP_CONTROL_SOCKET:
+      g_value_set_boolean(value, self->control_socket_enabled);
+      break;
+    case PROP_CONTROL_SOCKET_PATH:
+      g_value_set_string(value, self->control_socket_path);
+      break;
+    case PROP_RECONNECT:
+      g_value_set_boolean(value, self->reconnect_enabled);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
       break;
   }
+}
+
+/* "set-ptz" action handler: apply pan, tilt and zoom in one call. Each axis is
+ * driven only when the device reports it; returns TRUE only if at least one
+ * supported axis was driven and every attempted set succeeded. */
+static gboolean gst_libuvc_h264_src_set_ptz(GstLibuvcH264Src *self,
+                                            gint pan, gint tilt, gint zoom) {
+  gboolean any = FALSE;
+  gboolean ok = TRUE;
+
+  if (self->pan_supported) {
+    any = TRUE;
+    ok = gst_libuvc_h264_src_ptz_set_pan(self, pan) && ok;
+  }
+  if (self->tilt_supported) {
+    any = TRUE;
+    ok = gst_libuvc_h264_src_ptz_set_tilt(self, tilt) && ok;
+  }
+  if (self->zoom_supported) {
+    any = TRUE;
+    ok = gst_libuvc_h264_src_ptz_set_zoom(self, zoom) && ok;
+  }
+
+  return any && ok;
 }
 
 static gboolean gst_libuvc_h264_set_clock(GstElement *element, GstClock *clock) {
@@ -699,6 +496,155 @@ static gboolean gst_libuvc_h264_set_clock(GstElement *element, GstClock *clock) 
   return GST_ELEMENT_CLASS(gst_libuvc_h264_src_parent_class)->set_clock(element, clock);
 }
 
+/* The `index` property selects ONE device from the libuvc enumeration. It stays
+ * a string (downstream callers pass a bare ordinal), but now also
+ * accepts richer, hardware-stable selectors. Parsed ONCE at start():
+ *   "N"            ordinal into the enumerated list (UNCHANGED, the default)
+ *   "vid:pid"      hex vendor:product id, e.g. "1234:5678"
+ *   "serial:<sn>"  exact USB serial-number string
+ *   "bus:<b>:<a>"  decimal USB bus number and device address */
+typedef enum {
+  UVC_SEL_ORDINAL,
+  UVC_SEL_VID_PID,
+  UVC_SEL_SERIAL,
+  UVC_SEL_BUS_ADDR,
+} GstLibuvcSelectorType;
+
+typedef struct {
+  GstLibuvcSelectorType type;
+  long ordinal;
+  guint16 vid, pid;
+  const gchar *serial;   /* borrows the index string, not owned */
+  guint8 bus, addr;
+} GstLibuvcDeviceSelector;
+
+/* Parse one integer token that MUST consume the whole string (no trailing junk,
+ * no overflow, within [min,max]). base 10 or 16. Mirrors the Task-6 strtol
+ * validation so the ordinal path is byte-for-byte as strict as before. */
+static gboolean
+gst_libuvc_h264_src_parse_uint(const gchar *s, int base, long min, long max,
+                               long *out) {
+  if (s == NULL || *s == '\0')
+    return FALSE;
+  errno = 0;
+  char *end = NULL;
+  long v = strtol(s, &end, base);
+  if (end == s || *end != '\0' || errno != 0 || v < min || v > max)
+    return FALSE;
+  *out = v;
+  return TRUE;
+}
+
+/* Parse the `index` property into a selector. Returns FALSE with a human-readable
+ * reason in *errmsg on a malformed selector (caller maps it to RESOURCE/SETTINGS).
+ * A bare, non-negative decimal is the ordinal — anything that is not one of the
+ * three prefixed forms falls back to the ordinal parse and so still fails loudly
+ * (the old atoi()-silently-selects-0 trap stays closed). */
+static gboolean
+gst_libuvc_h264_src_parse_selector(const gchar *index,
+                                   GstLibuvcDeviceSelector *sel,
+                                   const gchar **errmsg) {
+  if (index == NULL) {
+    *errmsg = "index is NULL";
+    return FALSE;
+  }
+
+  if (g_str_has_prefix(index, "serial:")) {
+    const gchar *sn = index + strlen("serial:");
+    if (*sn == '\0') {
+      *errmsg = "serial selector requires a non-empty serial number";
+      return FALSE;
+    }
+    sel->type = UVC_SEL_SERIAL;
+    sel->serial = sn;
+    return TRUE;
+  }
+
+  if (g_str_has_prefix(index, "bus:")) {
+    const gchar *rest = index + strlen("bus:");
+    const gchar *colon = strchr(rest, ':');
+    if (colon == NULL) {
+      *errmsg = "bus selector requires \"bus:<bus>:<addr>\"";
+      return FALSE;
+    }
+    gchar *bus_str = g_strndup(rest, (gsize)(colon - rest));
+    long bus_v = 0, addr_v = 0;
+    gboolean ok = gst_libuvc_h264_src_parse_uint(bus_str, 10, 0, 255, &bus_v) &&
+                  gst_libuvc_h264_src_parse_uint(colon + 1, 10, 0, 255, &addr_v);
+    g_free(bus_str);
+    if (!ok) {
+      *errmsg = "bus selector requires \"bus:<bus>:<addr>\" (decimal 0..255 each)";
+      return FALSE;
+    }
+    sel->type = UVC_SEL_BUS_ADDR;
+    sel->bus = (guint8)bus_v;
+    sel->addr = (guint8)addr_v;
+    return TRUE;
+  }
+
+  /* A colon with no recognised prefix is the hex vid:pid form. */
+  const gchar *colon = strchr(index, ':');
+  if (colon != NULL) {
+    gchar *vid_str = g_strndup(index, (gsize)(colon - index));
+    long vid_v = 0, pid_v = 0;
+    gboolean ok = gst_libuvc_h264_src_parse_uint(vid_str, 16, 0, 0xFFFF, &vid_v) &&
+                  gst_libuvc_h264_src_parse_uint(colon + 1, 16, 0, 0xFFFF, &pid_v);
+    g_free(vid_str);
+    if (!ok) {
+      *errmsg = "vid:pid selector requires hex \"<vid>:<pid>\" (0000..ffff each)";
+      return FALSE;
+    }
+    sel->type = UVC_SEL_VID_PID;
+    sel->vid = (guint16)vid_v;
+    sel->pid = (guint16)pid_v;
+    return TRUE;
+  }
+
+  long ord = 0;
+  if (!gst_libuvc_h264_src_parse_uint(index, 10, 0, INT_MAX, &ord)) {
+    *errmsg = "index must be a non-negative integer ordinal, \"vid:pid\", "
+              "\"serial:<sn>\", or \"bus:<bus>:<addr>\"";
+    return FALSE;
+  }
+  sel->type = UVC_SEL_ORDINAL;
+  sel->ordinal = ord;
+  return TRUE;
+}
+
+/* Test one enumerated device against the parsed selector. `ordinal` is the
+ * device's position in the libuvc list. vid:pid and serial reads go through the
+ * libuvc descriptor (freed before returning); bus/addr read the cached topology.
+ * A device whose descriptor cannot be read simply does not match. */
+static gboolean
+gst_libuvc_h264_src_selector_matches(const GstLibuvcDeviceSelector *sel,
+                                     uvc_device_t *dev, int ordinal) {
+  switch (sel->type) {
+    case UVC_SEL_ORDINAL:
+      return (long)ordinal == sel->ordinal;
+    case UVC_SEL_VID_PID: {
+      uvc_device_descriptor_t *desc = NULL;
+      if (uvc_get_device_descriptor(dev, &desc) != UVC_SUCCESS || desc == NULL)
+        return FALSE;
+      gboolean ok = (desc->idVendor == sel->vid && desc->idProduct == sel->pid);
+      uvc_free_device_descriptor(desc);
+      return ok;
+    }
+    case UVC_SEL_SERIAL: {
+      uvc_device_descriptor_t *desc = NULL;
+      if (uvc_get_device_descriptor(dev, &desc) != UVC_SUCCESS || desc == NULL)
+        return FALSE;
+      gboolean ok = (desc->serialNumber != NULL &&
+                     g_strcmp0(desc->serialNumber, sel->serial) == 0);
+      uvc_free_device_descriptor(desc);
+      return ok;
+    }
+    case UVC_SEL_BUS_ADDR:
+      return (uvc_get_bus_number(dev) == sel->bus &&
+              uvc_get_device_address(dev) == sel->addr);
+  }
+  return FALSE;
+}
+
 static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(src);
   uvc_error_t res;
@@ -712,6 +658,33 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
     usleep(1000000); // Wait 1 second for USB to settle
   }
 
+  // Reset per-session frame state so a restart never forwards stale non-IDR
+  // frames (or a stale PTS baseline) before a fresh IDR re-establishes the
+  // stream. had_idr/send_sps_pps gate NAL forwarding in frame_callback(),
+  // frame_count/prev_int_ts seed the PTS interval estimator, and prev_pts/
+  // base_time use G_MAXUINT64 as the "latch on first frame" sentinel that
+  // frame_callback() and create() test for.
+  self->had_idr = FALSE;
+  self->send_sps_pps = FALSE;
+  self->frame_count = 0;
+  self->frame_offset = 0;
+  self->prev_int_ts = 0;
+  self->prev_pts = G_MAXUINT64;
+  self->base_time = G_MAXUINT64;
+  self->consecutive_timeouts = 0;
+
+  // Resolve the device selector up-front, before touching libuvc, so a
+  // malformed index fails loudly here instead of silently selecting device 0.
+  GstLibuvcDeviceSelector selector = {0};
+  const gchar *parse_err = NULL;
+  if (!gst_libuvc_h264_src_parse_selector(self->index, &selector, &parse_err)) {
+    GST_ELEMENT_ERROR(self, RESOURCE, SETTINGS,
+        ("Invalid device index \"%s\"", self->index ? self->index : "(null)"),
+        ("%s", parse_err));
+    return FALSE;
+  }
+  long device_ordinal = -1;
+
   // Initialize libuvc context
   res = uvc_init(&self->uvc_ctx, NULL);
   if (res < 0) {
@@ -722,31 +695,42 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   uvc_device_t **dev_list;
   res = uvc_find_devices(self->uvc_ctx, &dev_list, 0, 0, NULL);
   if (res < 0) {
-    GST_ERROR_OBJECT(self, "Unable to find any UVC devices");
+    GST_ELEMENT_ERROR(self, RESOURCE, NOT_FOUND,
+        ("No UVC devices found"),
+        ("uvc_find_devices failed: %s", uvc_strerror(res)));
     uvc_exit(self->uvc_ctx);
     self->uvc_ctx = NULL;
     return FALSE;
   }
 
   for (int i = 0; dev_list[i] != NULL; ++i) {
-    uvc_device_t *dev = dev_list[i];
-	if (i == atoi(self->index)) {
-		self->uvc_dev = dev;
-		break;
-	}
+    if (gst_libuvc_h264_src_selector_matches(&selector, dev_list[i], i)) {
+      self->uvc_dev = dev_list[i];
+      device_ordinal = i;
+      break;
+    }
   }
-  
+
   if (!self->uvc_dev) {
-    GST_ERROR_OBJECT(self, "Unable to find UVC device: %s", self->index);
+    GST_ELEMENT_ERROR(self, RESOURCE, NOT_FOUND,
+        ("No UVC device matching \"%s\"", self->index ? self->index : "(null)"),
+        ("selector matched none of the enumerated UVC devices"));
+    uvc_free_device_list(dev_list, 1);
     uvc_exit(self->uvc_ctx);
     self->uvc_ctx = NULL;
     return FALSE;
   }
 
-  // Open the UVC device
+  // The selected device aliases an entry in dev_list, and uvc_free_device_list()
+  // unrefs every entry; take our own reference first so it survives the free.
+  uvc_ref_device(self->uvc_dev);
+  uvc_free_device_list(dev_list, 1);
+
   res = uvc_open(self->uvc_dev, &self->uvc_devh);
   if (res < 0) {
-    GST_ERROR_OBJECT(self, "Unable to open UVC device: %s", uvc_strerror(res));
+    GST_ELEMENT_ERROR(self, RESOURCE, OPEN_READ_WRITE,
+        ("Unable to open UVC device at index %ld", device_ordinal),
+        ("uvc_open failed: %s", uvc_strerror(res)));
     uvc_unref_device(self->uvc_dev);
     self->uvc_dev = NULL;
     uvc_exit(self->uvc_ctx);
@@ -754,11 +738,24 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
     return FALSE;
   }
 
-  // Start control socket thread
-  self->control_running = TRUE;
-  self->control_thread = g_thread_new("uvc-control",
-                                     gst_libuvc_h264_src_control_thread,
-                                     self);
+  gst_libuvc_h264_src_v4l2_probe(GST_ELEMENT(self), (int)device_ordinal);
+
+  // Probe PTZ ranges so only axes the device actually exposes are driven (M6).
+  gst_libuvc_h264_src_ptz_probe_capabilities(self);
+
+  // Opt-in control socket (M9): bind here BEFORE the thread so the listening fd
+  // exists before any accept(); a bind failure is non-fatal to the media path.
+  if (self->control_socket_enabled) {
+    if (gst_libuvc_h264_src_control_socket_bind(self)) {
+      self->control_running = TRUE;
+      self->control_thread = g_thread_new("uvc-control",
+                                          gst_libuvc_h264_src_control_thread,
+                                          self);
+    } else {
+      GST_WARNING_OBJECT(self, "Control socket enabled but bind failed; "
+                         "continuing without it");
+    }
+  }
 
   GST_DEBUG_OBJECT(self, "Libuvc source started successfully");
   return TRUE;
@@ -774,31 +771,30 @@ static gboolean gst_libuvc_h264_src_stop(GstBaseSrc *src) {
   if (self->control_running) {
     GST_DEBUG_OBJECT(self, "Stopping control thread");
     self->control_running = FALSE;
-    
-    // Wake up control thread
-    int wakeup_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (wakeup_fd >= 0) {
-      struct sockaddr_un addr;
-      memset(&addr, 0, sizeof(addr));
-      addr.sun_family = AF_UNIX;
-      strcpy(addr.sun_path, "/tmp/libuvc_control");
-      fcntl(wakeup_fd, F_SETFL, O_NONBLOCK);
-      connect(wakeup_fd, (struct sockaddr*)&addr, sizeof(addr));
-      close(wakeup_fd);
+
+    // Nudge the thread out of its select() at once by self-connecting to the
+    // bound path; the 1s select timeout is the fallback if this misses.
+    if (self->control_socket_path != NULL) {
+      int wakeup_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+      if (wakeup_fd >= 0) {
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        g_strlcpy(addr.sun_path, self->control_socket_path, sizeof(addr.sun_path));
+        fcntl(wakeup_fd, F_SETFL, O_NONBLOCK);
+        connect(wakeup_fd, (struct sockaddr*)&addr, sizeof(addr));
+        close(wakeup_fd);
+      }
     }
-    
+
     if (self->control_thread) {
       g_thread_join(self->control_thread);
       self->control_thread = NULL;
     }
   }
 
-  // Close control socket
-  if (self->control_socket >= 0) {
-    close(self->control_socket);
-    self->control_socket = -1;
-    unlink("/tmp/libuvc_control");
-  }
+  // Close the listening fd and unlink the per-instance socket path.
+  gst_libuvc_h264_src_control_socket_unbind(self);
 
   // CRITICAL FIX: Stop streaming and force USB release
   if (self->streaming && self->uvc_devh) {
@@ -838,192 +834,169 @@ static gboolean gst_libuvc_h264_src_stop(GstBaseSrc *src) {
     self->uvc_ctx = NULL;
   }
 
-  // Clear mutex
-  g_mutex_clear(&self->control_mutex);
+  // control_mutex is NOT cleared here: stop() runs on every restart and is even
+  // re-entered from start()'s cleanup path, so clearing it would leave the
+  // control thread locking a destroyed mutex. It is cleared once in finalize().
 
   GST_DEBUG_OBJECT(self, "Libuvc source fully stopped");
   return TRUE;
 }
 
-void frame_callback(uvc_frame_t *frame, void *ptr) {
-    GstLibuvcH264Src *self = (GstLibuvcH264Src *)ptr;
+// Interrupt a create() that is blocked waiting for a frame (e.g. on disconnect
+// or shutdown), so state changes and teardown never deadlock on a silent source.
+static gboolean gst_libuvc_h264_src_unlock(GstBaseSrc *src) {
+  GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(src);
 
-    if (!frame || !frame->data || frame->data_bytes <= 0) {
-        GST_WARNING_OBJECT(self, "Empty or invalid frame received.");
-        return;
+  GST_DEBUG_OBJECT(self, "Unlock: interrupting create()");
+
+  g_atomic_int_set(&self->flushing, 1);
+  g_async_queue_push(self->frame_queue, FLUSH_SENTINEL);
+
+  return TRUE;
+}
+
+static gboolean gst_libuvc_h264_src_unlock_stop(GstBaseSrc *src) {
+  GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(src);
+
+  GST_DEBUG_OBJECT(self, "Unlock stop: resuming create()");
+
+  g_atomic_int_set(&self->flushing, 0);
+
+  // Drop sentinels (and any frames buffered during the flush) so the next
+  // create() resumes from a clean queue.
+  gpointer item;
+  while ((item = g_async_queue_try_pop(self->frame_queue)) != NULL) {
+    if (item != FLUSH_SENTINEL) {
+      gst_buffer_unref(item);
     }
-	
-	unsigned char* data = frame->data;
-    gboolean updated_sps_pps = FALSE;
+  }
 
-    #define MAX_UNITS_MAIN 10
-    nal_unit_t units[MAX_UNITS_MAIN];
-    int c = parse_nal_units(self->frame_format, units, MAX_UNITS_MAIN, data, frame->data_bytes);
+  return TRUE;
+}
 
-    if (!self->clock) return;
-    GstClockTime now = gst_clock_get_time(self->clock);
+/* Opt-in in-element reconnect (Task 18), gated on the Task 4 spike verdict.
+ *
+ * Runs on the streaming thread from inside create() after a sustained-silence
+ * disconnect is detected, so it never races stop() (GstBaseSrc serialises them;
+ * unlock() only sets the flushing flag). Tears the dead handle down with the
+ * spike's verified NATIVE sequence and re-resolves the `index` selector against
+ * a fresh enumeration (bus/address can change across a replug), then reopens and
+ * restarts streaming with bounded exponential backoff. Returns TRUE once
+ * streaming has resumed, FALSE if every retry was exhausted or a concurrent
+ * unlock() asked us to bail.
+ *
+ * CRITICAL: never call gst_libuvc_h264_src_force_usb_release() here — the spike
+ * proved force_usb_release()+uvc_close() double-closes the libusb handle. The
+ * native uvc_stop_streaming()->uvc_close() owns the single libusb_close(). */
+static gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
+  GstLibuvcDeviceSelector selector = {0};
+  const gchar *parse_err = NULL;
+  if (!gst_libuvc_h264_src_parse_selector(self->index, &selector, &parse_err)) {
+    GST_ERROR_OBJECT(self, "Reconnect: invalid index \"%s\": %s",
+                     self->index ? self->index : "(null)", parse_err);
+    return FALSE;
+  }
 
-    if (self->base_time == G_MAXUINT64) {
-        GstClockTime base_time = gst_element_get_base_time(GST_ELEMENT(self));
-        self->base_time = base_time;
+  // Native teardown of the dead handle (NO force_usb_release — double-free).
+  if (self->uvc_devh) {
+    uvc_stop_streaming(self->uvc_devh);
+    self->streaming = FALSE;
+    uvc_close(self->uvc_devh);
+    self->uvc_devh = NULL;
+  }
+  if (self->uvc_dev) {
+    uvc_unref_device(self->uvc_dev);
+    self->uvc_dev = NULL;
+  }
+
+  // Drop anything left in the queue so a resumed stream never forwards a frame
+  // captured before the disconnect (offset/PTS would be inconsistent).
+  gpointer stale;
+  while ((stale = g_async_queue_try_pop(self->frame_queue)) != NULL) {
+    if (stale != FLUSH_SENTINEL) {
+      gst_buffer_unref(stale);
     }
-    GstClockTime ts = now - self->base_time;
+  }
 
-    for (int i = 0; i < c; i++) {
-        nal_unit_t *unit = &units[i];
-        GstBuffer *buffer = NULL;
-        gsize buffer_offset = 0;
-
-        switch (unit->type) {
-            case UNIT_VPS:
-                self->vps_length = unit->len;
-                memcpy(self->vps, unit->ptr, self->vps_length);
-                updated_sps_pps = TRUE;
-                self->send_sps_pps = TRUE;
-                // deliberately not sending VPS/SPS/PPS info in their own buffer
-                continue;
-            case UNIT_SPS:
-                self->sps_length = unit->len;
-                memcpy(self->sps, unit->ptr, self->sps_length);
-                updated_sps_pps = TRUE;
-                self->send_sps_pps = TRUE;
-                // deliberately not sending VPS/SPS/PPS info in their own buffer
-                continue;
-            case UNIT_PPS:
-                self->pps_length = unit->len;
-                memcpy(self->pps, unit->ptr, self->pps_length);
-                updated_sps_pps = TRUE;
-                self->send_sps_pps = TRUE;
-                // deliberately not sending VPS/SPS/PPS info in their own buffer
-                continue;
-            case UNIT_FRAME_IDR: {
-                if (!self->had_idr || self->send_sps_pps) {
-                    buffer_offset = self->sps_length + self->pps_length;
-                    if (self->frame_format == UVC_FRAME_FORMAT_H265) {
-                        buffer_offset += self->vps_length;
-                    }
-
-                    buffer = gst_buffer_new_allocate(NULL, buffer_offset + unit->len, NULL);
-                    int offset = 0;
-                    if (self->frame_format == UVC_FRAME_FORMAT_H265) {
-                        gst_buffer_fill(buffer, offset, self->vps, self->vps_length);
-                        offset += self->vps_length;
-                    }
-                    gst_buffer_fill(buffer, offset, self->sps, self->sps_length);
-                    offset += self->sps_length;
-
-                    gst_buffer_fill(buffer, offset, self->pps, self->pps_length);
-                    self->send_sps_pps = FALSE;
-                }
-                if (!self->had_idr) {
-                    self->had_idr = TRUE;
-                }
-                break;
-            }
-            default:
-                if (!self->had_idr) {
-                    continue;
-                }
-        }
-
-        if (!buffer) {
-          buffer = gst_buffer_new_allocate(NULL, unit->len, NULL);
-        }
-        gst_buffer_fill(buffer, buffer_offset, unit->ptr, unit->len);
-
-        // Set timestamps on the buffer
-        if (units[i].type == UNIT_FRAME_IDR || units[i].type == UNIT_FRAME_NON_IDR) {
-            /* The problems:
-               * libuvc capture timestamps are jittery
-               * video players skip and duplicate frames if the PTSes are noisy
-               * the actual framerate is never precisely equal to the nominal value,
-                 and can drift over time
-            */
-
-            // We'll set the first PTS to the current timestamp ts
-            if (self->prev_pts == G_MAXUINT64) {
-                self->prev_pts = ts - self->frame_interval;
-            }
-
-            // Update the PTS calculation on the first IDR after MIN_FRAMES_CALC_INTERVAL frames
-            self->frame_count++;
-            gboolean update_pts_calc = (units[i].type == UNIT_FRAME_IDR &&
-                                        self->frame_count >= MIN_FRAMES_CALC_INTERVAL);
-
-            int64_t timestamp_offset = 0;
-            if (update_pts_calc) {
-                // Discard the first set of results, as they can be quite noisy
-                if (self->prev_int_ts != 0) {
-                    #define AVG_DIV 20
-                    #define AVG_MULT 1
-                    #define AVG_ROUNDING (AVG_DIV/2)
-
-                    #define CLOCK_START_LEN (MIN_FRAMES_CALC_INTERVAL * 3 * (uint64_t)self->frame_interval)
-                    #define PTS_JUMP_THRESHOLD (80L * 1000L * 1000L) // 80 ms
-                    #define PTS_STRETCH_HYST   (8L * 1000L * 1000L)  //  8 ms
-                    #define PTS_STRETCH_VAL    (50L * 1000L)         // 50 us (per frame)
-
-
-                    // Average frame interval tracking
-                    int64_t interval = ((ts - self->prev_int_ts) + self->frame_count / 2) / self->frame_count;
-                    self->frame_interval = (self->frame_interval * (AVG_DIV-AVG_MULT) +
-                                            interval + AVG_ROUNDING) / AVG_DIV;
-
-
-                    // Determine if we need to resync the PTSes with the running clock
-                    int64_t avg_offset = (self->pts_offset_sum + self->frame_count/2) / self->frame_count;
-                    GST_DEBUG_OBJECT(self, "measured frame interval %ld us, average interval %ld us, "
-                                           "average PTS offset: %ld us",
-                                           interval / 1000, self->frame_interval / 1000, avg_offset / 1000);
-
-                    // Usually we don't need to stretch the frame interval
-                    self->pts_stretch = 0;
-
-                    /* After just starting, jump immediately to resync on delta longer than a frame interval.
-                       During normal execution, prefer gradual resync as it's less noticeable
-                       We've seen delta up to around 75ms caused by dropped frames on a Pocket 3 in 4K60 */
-                    if ((ts < CLOCK_START_LEN &&
-                        (avg_offset < -self->frame_interval || avg_offset > self->frame_interval)) ||
-                        avg_offset < -PTS_JUMP_THRESHOLD || avg_offset > PTS_JUMP_THRESHOLD) {
-                        timestamp_offset = avg_offset;
-                        GST_DEBUG_OBJECT(self, "  adjusting PTS offset by: %ld us", timestamp_offset / 1000);
-
-                    // For smaller delta of +/- 8ms, slightly stretch or compress frame intervals to catch up
-                    } else if (avg_offset > PTS_STRETCH_HYST) {
-                        self->pts_stretch = PTS_STRETCH_VAL;
-                        GST_DEBUG_OBJECT(self, "  stretching PTS interval by: %ld us", self->pts_stretch / 1000);
-
-                    } else if (avg_offset < -PTS_STRETCH_HYST) {
-                        self->pts_stretch = -PTS_STRETCH_VAL;
-                        GST_DEBUG_OBJECT(self, "  compressing PTS interval by: %ld us", -self->pts_stretch / 1000);
-
-                    }
-                }
-
-                // Reset all the counters regardless of whether the PTS calculations were updated
-                self->frame_count = 0;
-                self->pts_offset_sum = 0;
-                self->prev_int_ts = ts;
-            }
-
-            GstClockTime timestamp = self->prev_pts + self->frame_interval + self->pts_stretch + timestamp_offset;
-            int64_t offset = ts - timestamp;
-            self->pts_offset_sum += offset;
-
-            GST_BUFFER_PTS(buffer) = timestamp;
-            GST_BUFFER_DTS(buffer) = timestamp;
-            GST_BUFFER_DURATION(buffer) = timestamp - self->prev_pts;
-            GST_LOG_OBJECT(self, "PTS %lu, offset %ld us", timestamp, offset / 1000);
-
-            self->prev_pts = timestamp;
-        }
-
-        g_async_queue_push(self->frame_queue, buffer);
+  guint backoff_s = RECONNECT_BACKOFF_INITIAL_S;
+  for (int attempt = 0; attempt < RECONNECT_MAX_RETRIES; attempt++) {
+    // Interruptible backoff: bail at once if unlock() flagged a flush, so
+    // teardown never blocks for the full (up to 16 s) backoff window.
+    for (guint slept_ms = 0; slept_ms < backoff_s * 1000; slept_ms += 100) {
+      if (g_atomic_int_get(&self->flushing)) {
+        return FALSE;
+      }
+      g_usleep(100 * 1000);
     }
 
-    if (updated_sps_pps) {
-        store_spspps(self);
+    GST_DEBUG_OBJECT(self, "Reconnect attempt %d/%d (after %u s backoff)",
+                     attempt + 1, RECONNECT_MAX_RETRIES, backoff_s);
+    backoff_s *= 2;
+
+    uvc_device_t **dev_list = NULL;
+    if (uvc_find_devices(self->uvc_ctx, &dev_list, 0, 0, NULL) < 0 ||
+        dev_list == NULL) {
+      continue;
     }
+
+    uvc_device_t *selected = NULL;
+    for (int i = 0; dev_list[i] != NULL; i++) {
+      if (gst_libuvc_h264_src_selector_matches(&selector, dev_list[i], i)) {
+        selected = dev_list[i];
+        break;
+      }
+    }
+    if (selected == NULL) {
+      uvc_free_device_list(dev_list, 1);
+      continue;
+    }
+
+    // Ref the chosen device before freeing the list (free unrefs every entry).
+    uvc_ref_device(selected);
+    uvc_free_device_list(dev_list, 1);
+
+    if (uvc_open(selected, &self->uvc_devh) < 0) {
+      self->uvc_devh = NULL;
+      uvc_unref_device(selected);
+      continue;
+    }
+    self->uvc_dev = selected;
+
+    if (uvc_get_stream_ctrl_format_size(self->uvc_devh, &self->uvc_ctrl,
+            self->frame_format, self->negotiated_width, self->negotiated_height,
+            self->negotiated_framerate) < 0) {
+      uvc_close(self->uvc_devh);
+      self->uvc_devh = NULL;
+      uvc_unref_device(self->uvc_dev);
+      self->uvc_dev = NULL;
+      continue;
+    }
+
+    // Re-arm the stream state BEFORE the feeder spawns so frame_callback sees the
+    // reset (pthread_create in uvc_start_streaming is the happens-before edge):
+    // re-latch the PTS baseline and re-engage the IDR gate after the gap.
+    self->had_idr = FALSE;
+    self->send_sps_pps = FALSE;
+    self->base_time = G_MAXUINT64;
+    self->prev_pts = G_MAXUINT64;
+
+    if (uvc_start_streaming(self->uvc_devh, &self->uvc_ctrl, frame_callback,
+                            self, 0) < 0) {
+      uvc_close(self->uvc_devh);
+      self->uvc_devh = NULL;
+      uvc_unref_device(self->uvc_dev);
+      self->uvc_dev = NULL;
+      continue;
+    }
+
+    self->streaming = TRUE;
+    GST_INFO_OBJECT(self, "Reconnect succeeded on attempt %d", attempt + 1);
+    return TRUE;
+  }
+
+  GST_WARNING_OBJECT(self, "Reconnect exhausted after %d attempts",
+                     RECONNECT_MAX_RETRIES);
+  return FALSE;
 }
 
 static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf) {
@@ -1047,13 +1020,59 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
     }
   }
 
-  *buf = g_async_queue_pop(self->frame_queue);
-  if (*buf == NULL) {
-    GST_ERROR_OBJECT(self, "No frame available.");
-    return GST_FLOW_ERROR;
-  }
+  // Bounded wait so unlock() can interrupt a stalled capture: the timeout is a
+  // backstop for a silent source, while unlock()'s sentinel wakes us at once.
+  while (TRUE) {
+    gpointer item = g_async_queue_timeout_pop(self->frame_queue, TIMEOUT_DURATION);
 
-  return GST_FLOW_OK;
+    if (g_atomic_int_get(&self->flushing)) {
+      if (item != NULL && item != FLUSH_SENTINEL) {
+        gst_buffer_unref(item);
+      }
+      return GST_FLOW_FLUSHING;
+    }
+
+    if (item == NULL) {
+      // A real pop timeout. libuvc delivers no NULL frame on unplug in callback
+      // mode (it just goes silent, per the Task 4 spike), so sustained silence
+      // is how a disconnect is detected. Count consecutive timeouts; a single
+      // gap is tolerated, but DISCONNECT_TIMEOUT_COUNT in a row means the device
+      // is gone.
+      if (++self->consecutive_timeouts < DISCONNECT_TIMEOUT_COUNT) {
+        continue;
+      }
+
+      GST_WARNING_OBJECT(self, "Device silent for %d s, assuming disconnect",
+                         DISCONNECT_TIMEOUT_COUNT);
+
+      // Opt-in reconnect: try to resume before erroring. Default off, so a
+      // disconnect always surfaces as a RESOURCE/READ error downstream.
+      if (self->reconnect_enabled && gst_libuvc_h264_src_reconnect(self)) {
+        self->consecutive_timeouts = 0;
+        continue;
+      }
+
+      // A flush raced in during the reconnect backoff: honour it over the error.
+      if (g_atomic_int_get(&self->flushing)) {
+        return GST_FLOW_FLUSHING;
+      }
+
+      gst_libuvc_h264_src_post_disconnect_error(GST_ELEMENT(self));
+      return GST_FLOW_ERROR;
+    }
+
+    if (item == FLUSH_SENTINEL) {
+      // A stale sentinel from a finished flush: not silence, so reset the
+      // disconnect counter and keep waiting.
+      self->consecutive_timeouts = 0;
+      continue;
+    }
+
+    // A real frame arrived: silence is broken.
+    self->consecutive_timeouts = 0;
+    *buf = item;
+    return GST_FLOW_OK;
+  }
 }
 
 static void gst_libuvc_h264_src_finalize(GObject *object) {
@@ -1069,6 +1088,12 @@ static void gst_libuvc_h264_src_finalize(GObject *object) {
         self->index = NULL;
     }
 
+    // stop() above already unlinked the socket; free the owned path string.
+    if (self->control_socket_path) {
+        g_free(self->control_socket_path);
+        self->control_socket_path = NULL;
+    }
+
     if (self->frame_queue) {
         GstBuffer *buffer;
         while ((buffer = g_async_queue_try_pop(self->frame_queue)) != NULL) {
@@ -1078,6 +1103,10 @@ static void gst_libuvc_h264_src_finalize(GObject *object) {
         g_async_queue_unref(self->frame_queue);
         self->frame_queue = NULL;
     }
+
+    // Sole clear point for control_mutex (paired with g_mutex_init in init): the
+    // control thread was already joined by stop() above, so this is race-free.
+    g_mutex_clear(&self->control_mutex);
 
     GST_DEBUG_OBJECT(self, "Libuvc source finalized");
 
@@ -1092,7 +1121,7 @@ static gboolean plugin_init(GstPlugin *plugin) {
 }
 
 #define PACKAGE "libuvch264src"
-#define VERSION "1.0"
+#define VERSION "2.0"
 GST_PLUGIN_DEFINE(
     GST_VERSION_MAJOR,
     GST_VERSION_MINOR,
