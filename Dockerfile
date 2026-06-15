@@ -33,6 +33,7 @@ RUN git clone --depth 1 --branch v0.0.7 https://github.com/libuvc/libuvc.git . &
 	patch -p1 < /app/patches/uvc15-support.patch && \
 	patch -p1 < /app/patches/libuvc-h265-support.patch && \
 	cmake . \
+		-DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
 		-DCMAKE_BUILD_TYPE=Release \
 		-DBUILD_SHARED_LIBS=ON \
 		-DBUILD_EXAMPLE=OFF \
