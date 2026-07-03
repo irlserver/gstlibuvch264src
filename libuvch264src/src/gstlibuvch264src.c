@@ -13,6 +13,7 @@
 #include "frame_pipeline.h"
 #include "spspps_cache.h"
 #include "ptz_control.h"
+#include "quirks.h"
 #include <gst/gst.h>
 #include <libuvc/libuvc.h>
 
@@ -190,6 +191,34 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   gst_base_src_set_format(GST_BASE_SRC(self), GST_FORMAT_TIME);
 }
 
+/* Log a full inventory of every format/frame descriptor the device advertises.
+ * Called from negotiate() right before the no-H264/H265 bus error so field
+ * triage (GST_DEBUG=libuvch264src:3) can see WHAT the camera actually offered -
+ * fourcc/guid plus each frame's resolution and interval range - when it exposes
+ * no codec the element can stream. */
+static void gst_libuvc_h264_src_log_format_inventory(GstLibuvcH264Src *self) {
+    for (const uvc_format_desc_t *format_desc = uvc_get_format_descs(self->uvc_devh);
+         format_desc; format_desc = format_desc->next)
+    {
+        const guint8 *g = format_desc->guidFormat;
+        GST_WARNING_OBJECT(self,
+            "  format fourcc '%.4s' guid "
+            "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+            format_desc->fourccFormat,
+            g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7],
+            g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
+
+        for (const uvc_frame_desc_t *frame_desc = format_desc->frame_descs;
+             frame_desc; frame_desc = frame_desc->next)
+        {
+            GST_WARNING_OBJECT(self,
+                "    %ux%u frame interval [%u..%u] (100ns units)",
+                frame_desc->wWidth, frame_desc->wHeight,
+                frame_desc->dwMinFrameInterval, frame_desc->dwMaxFrameInterval);
+        }
+    }
+}
+
 static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
     GstLibuvcH264Src *self = GST_LIBUVC_H264_SRC(basesrc);
 
@@ -303,9 +332,13 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
 
     if (!found_codec_format) {
         // The device exposes no H264/H265 format descriptor at all, so there is
-        // nothing to stream. Post a bus ERROR (not just a debug log) so
+        // nothing to stream. Log a full inventory of what it DID advertise first
+        // (field triage), then post a bus ERROR (not just a debug log) so
         // downstream consumers can react, instead of falling
         // through with uninitialized width/height/framerate.
+        GST_WARNING_OBJECT(self,
+            "device exposes no H264/H265 format; advertised formats follow:");
+        gst_libuvc_h264_src_log_format_inventory(self);
         gst_libuvc_h264_src_post_error(GST_ELEMENT(self), UVC_ERROR_NOT_SUPPORTED,
             "negotiating caps: device exposes no H264/H265 format");
         goto out;
@@ -316,6 +349,25 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
     if (width < 0 || height < 0 || framerate <= 0 || !best_caps) {
         GST_ERROR_OBJECT(self, "Unable to negotiate common caps");
         goto out;
+    }
+
+    // vid:pid quirk seam (A14). The production table ships empty, so
+    // uvc_quirks_lookup() returns 0 for every device and the probe count below
+    // is unchanged; a matching entry can request QUIRK_DOUBLE_PROBE (libuvc #242)
+    // to issue the format-size probe twice, discarding the first result.
+    guint32 quirks = 0;
+    uvc_device_descriptor_t *quirk_desc = NULL;
+    if (uvc_get_device_descriptor(self->uvc_dev, &quirk_desc) == UVC_SUCCESS
+        && quirk_desc != NULL) {
+        quirks = uvc_quirks_lookup(quirk_desc->idVendor, quirk_desc->idProduct);
+        uvc_free_device_descriptor(quirk_desc);
+    }
+
+    if (quirks & QUIRK_DOUBLE_PROBE) {
+        // Some devices return a stale/rejected stream control on the first
+        // probe; run it once and discard the result before the real probe.
+        uvc_get_stream_ctrl_format_size(self->uvc_devh, &self->uvc_ctrl,
+                                        self->frame_format, width, height, framerate);
     }
 
     int res = uvc_get_stream_ctrl_format_size(self->uvc_devh, &self->uvc_ctrl,
