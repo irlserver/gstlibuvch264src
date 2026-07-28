@@ -16,6 +16,7 @@
 #include "quirks.h"
 #include <gst/gst.h>
 #include <libuvc/libuvc.h>
+#include <libusb-1.0/libusb.h>
 
 GST_DEBUG_CATEGORY(gst_libuvc_h264_src_debug);
 
@@ -39,6 +40,16 @@ enum {
 /* Opt-in in-element reconnect: bounded exponential backoff 1,2,4,8,16 s. */
 #define RECONNECT_MAX_RETRIES 5
 #define RECONNECT_BACKOFF_INITIAL_S 1
+
+/* Frames a port-reset recovery must deliver before the one-shot re-arms. ~1 s at
+ * 30 fps: enough to distinguish a device that genuinely came back from one that
+ * emits a frame and immediately re-wedges (which would otherwise reset forever). */
+#define RESET_RECOVERY_REARM_FRAMES 30
+/* Settle window between a USB port reset and the reopen. MEASURED on a DJI Osmo
+ * Pocket 3: a reopen ~1 s after the reset succeeds but yields zero frames; the
+ * device needs several seconds to re-enumerate and re-arm its streaming
+ * endpoint. Interruptible, so it never delays a NULL/PAUSED transition. */
+#define RESET_SETTLE_MS 4000
 
 #define H264_CAPS "video/x-h264," \
                   "stream-format=(string)byte-stream," \
@@ -166,6 +177,8 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->streaming = FALSE;
   self->flushing = 0;
   self->consecutive_timeouts = 0;
+  self->reset_recovery_used = FALSE;
+  self->frames_since_reset = 0;
   self->reconnect_enabled = FALSE;
   self->frame_offset = 0;
   self->base_time = G_MAXUINT64;
@@ -724,6 +737,8 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   self->prev_pts = G_MAXUINT64;
   self->base_time = G_MAXUINT64;
   self->consecutive_timeouts = 0;
+  self->reset_recovery_used = FALSE;
+  self->frames_since_reset = 0;
 
   // Resolve the device selector up-front, before touching libuvc, so a
   // malformed index fails loudly here instead of silently selecting device 0.
@@ -940,7 +955,8 @@ static gboolean gst_libuvc_h264_src_unlock_stop(GstBaseSrc *src) {
  * CRITICAL: never call gst_libuvc_h264_src_force_usb_release() here — the spike
  * proved force_usb_release()+uvc_close() double-closes the libusb handle. The
  * native uvc_stop_streaming()->uvc_close() owns the single libusb_close(). */
-static gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
+static gboolean gst_libuvc_h264_src_reconnect_bounded(GstLibuvcH264Src *self,
+                                                      gint max_retries) {
   GstLibuvcDeviceSelector selector = {0};
   const gchar *parse_err = NULL;
   if (!gst_libuvc_h264_src_parse_selector(self->index, &selector, &parse_err)) {
@@ -971,7 +987,7 @@ static gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
   }
 
   guint backoff_s = RECONNECT_BACKOFF_INITIAL_S;
-  for (int attempt = 0; attempt < RECONNECT_MAX_RETRIES; attempt++) {
+  for (int attempt = 0; attempt < max_retries; attempt++) {
     // Interruptible backoff: bail at once if unlock() flagged a flush, so
     // teardown never blocks for the full (up to 16 s) backoff window.
     for (guint slept_ms = 0; slept_ms < backoff_s * 1000; slept_ms += 100) {
@@ -982,7 +998,7 @@ static gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
     }
 
     GST_DEBUG_OBJECT(self, "Reconnect attempt %d/%d (after %u s backoff)",
-                     attempt + 1, RECONNECT_MAX_RETRIES, backoff_s);
+                     attempt + 1, max_retries, backoff_s);
     backoff_s *= 2;
 
     uvc_device_t **dev_list = NULL;
@@ -1047,8 +1063,64 @@ static gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
   }
 
   GST_WARNING_OBJECT(self, "Reconnect exhausted after %d attempts",
-                     RECONNECT_MAX_RETRIES);
+                     max_retries);
   return FALSE;
+}
+
+static gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
+  return gst_libuvc_h264_src_reconnect_bounded(self, RECONNECT_MAX_RETRIES);
+}
+
+/* Clear a WEDGED device: still enumerated, still answering every control
+ * transfer (descriptors, probe/commit, PTZ), yet delivering nothing on the
+ * streaming endpoint. Measured on a DJI Osmo Pocket 3 (2ca3:0023) after the
+ * holding process died without uvc_close(): the interface's alternate setting is
+ * never wound back, so the device stays armed for a host that is gone and
+ * refuses to stream for the next one. Reproduced identically through libuvc AND
+ * through the kernel uvcvideo driver, which is what proves it is device state
+ * rather than anything in this element.
+ *
+ * A close/reopen does NOT clear it (measured). A USB port reset does, every
+ * time. libusb_reset_device() issues exactly that, so the recovery needs no
+ * sysfs write and no privilege this process does not already have.
+ *
+ * LIBUSB_ERROR_NOT_FOUND is a SUCCESS for our purpose: libusb returns it when
+ * the reset re-enumerated the device, which is precisely the outcome we want.
+ * It only means the caller must reopen from a fresh enumeration, which is what
+ * gst_libuvc_h264_src_reconnect_bounded() does. Any other status means the port
+ * reset itself did not happen, so the device really is unreachable. */
+static gboolean gst_libuvc_h264_src_reset_silent_device(GstLibuvcH264Src *self) {
+  if (self->uvc_devh == NULL) {
+    return FALSE;
+  }
+  libusb_device_handle *usb_devh = uvc_get_libusb_handle(self->uvc_devh);
+  if (usb_devh == NULL) {
+    GST_DEBUG_OBJECT(self, "No libusb handle; cannot port-reset a silent device");
+    return FALSE;
+  }
+
+  gint rc = libusb_reset_device(usb_devh);
+  if (rc != LIBUSB_SUCCESS && rc != LIBUSB_ERROR_NOT_FOUND) {
+    GST_WARNING_OBJECT(self, "USB port reset failed (%d); device is unreachable", rc);
+    return FALSE;
+  }
+
+  GST_INFO_OBJECT(self, "USB port reset issued on a silent-but-present device%s",
+                  rc == LIBUSB_ERROR_NOT_FOUND ? " (re-enumerated)" : "");
+
+  // A port reset re-enumerates the device, and the reopen must not race that.
+  // MEASURED: reopening ~1 s after the reset reliably succeeds (uvc_open() and
+  // uvc_start_streaming() both return OK) and then delivers no frames at all,
+  // which is indistinguishable from the wedge just cleared. Wait in the same
+  // interruptible steps as the reconnect backoff, so a flush still tears down
+  // promptly.
+  for (guint slept_ms = 0; slept_ms < RESET_SETTLE_MS; slept_ms += 100) {
+    if (g_atomic_int_get(&self->flushing)) {
+      return FALSE;
+    }
+    g_usleep(100 * 1000);
+  }
+  return TRUE;
 }
 
 static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf) {
@@ -1099,9 +1171,30 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
 
       // Opt-in reconnect: try to resume before erroring. Default off, so a
       // disconnect always surfaces as a RESOURCE/READ error downstream.
-      if (self->reconnect_enabled && gst_libuvc_h264_src_reconnect(self)) {
-        self->consecutive_timeouts = 0;
-        continue;
+      if (self->reconnect_enabled) {
+        if (gst_libuvc_h264_src_reconnect(self)) {
+          self->consecutive_timeouts = 0;
+          continue;
+        }
+      } else if (!self->reset_recovery_used) {
+        // Sustained silence has TWO indistinguishable causes from here: the
+        // device was unplugged, or it is still present but WEDGED (see
+        // gst_libuvc_h264_src_reset_silent_device). With reconnect off we still
+        // owe the wedged case ONE port reset plus a single reopen, because
+        // "the device was removed" is factually wrong for a device that is still
+        // on the bus, and a reset is the only thing that recovers it. A
+        // genuinely absent device fails the reset, so this costs an unplugged
+        // device nothing and cannot mask a real disconnect. Deliberately ONE
+        // reopen, not the opt-in path's full retry ladder: `reconnect` stays the
+        // property that buys the ladder.
+        self->reset_recovery_used = TRUE;
+        self->frames_since_reset = 0;
+        if (gst_libuvc_h264_src_reset_silent_device(self) &&
+            gst_libuvc_h264_src_reconnect_bounded(self, 1)) {
+          GST_INFO_OBJECT(self, "Recovered a wedged device via USB port reset");
+          self->consecutive_timeouts = 0;
+          continue;
+        }
       }
 
       // A flush raced in during the reconnect backoff: honour it over the error.
@@ -1120,7 +1213,14 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
       continue;
     }
 
-    // A real frame arrived: silence is broken.
+    // A real frame arrived: silence is broken. Re-arm the one-shot reset only
+    // once the device has PROVEN it recovered, so a LATER wedge is recoverable
+    // (without this the recovery would fire at most once per session) but a
+    // device that emits one frame and re-wedges cannot reset the port forever.
+    if (self->reset_recovery_used
+        && ++self->frames_since_reset >= RESET_RECOVERY_REARM_FRAMES) {
+      self->reset_recovery_used = FALSE;
+    }
     self->consecutive_timeouts = 0;
     *buf = item;
     return GST_FLOW_OK;

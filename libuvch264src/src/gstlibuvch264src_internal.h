@@ -37,6 +37,15 @@ struct _GstLibuvcH264Src {
    * create() infers a disconnect after DISCONNECT_TIMEOUT_COUNT consecutive 1s
    * timeouts. Reset in start() and whenever a real frame arrives. */
   gint consecutive_timeouts;
+  /* One-shot USB port-reset recovery for a WEDGED device: enumerated, answering
+   * every control transfer, yet delivering no payload on the streaming endpoint.
+   * Close/reopen and a kernel-driver reattach both leave it wedged; only a port
+   * reset clears it. Armed in start(), consumed once per silence episode, and
+   * re-armed once RESET_RECOVERY_REARM_FRAMES real frames have arrived (so a
+   * later wedge is recoverable, but a device that emits one frame and re-wedges
+   * cannot reset the port forever). */
+  gboolean reset_recovery_used;
+  guint frames_since_reset; /* frames delivered since the last port reset */
   gboolean reconnect_enabled; /* PROP_RECONNECT: opt-in in-element auto-reconnect */
   GstClock *clock;
   int64_t pts_offset_sum;
