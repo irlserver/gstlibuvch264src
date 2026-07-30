@@ -14,6 +14,8 @@ nal_unit_type_t convert_unit_type(enum uvc_frame_format format, int type) {
                 return UNIT_SPS;
             case 8:
                 return UNIT_PPS;
+            case 9:
+                return UNIT_AUD;
       }
 
     } else if (format == UVC_FRAME_FORMAT_H265) {
@@ -28,6 +30,8 @@ nal_unit_type_t convert_unit_type(enum uvc_frame_format format, int type) {
                 return UNIT_SPS;
             case 34:
                 return UNIT_PPS;
+            case 35:  /* AUD_NUT */
+                return UNIT_AUD;
         }
     }
 
@@ -125,6 +129,135 @@ gsize parse_nal_units(enum uvc_frame_format format,
     return i;
 }
 
+static gboolean nal_is_parameter_set(nal_unit_type_t type) {
+    return type == UNIT_VPS || type == UNIT_SPS || type == UNIT_PPS;
+}
+
+static gboolean nal_is_slice(nal_unit_type_t type) {
+    return type == UNIT_FRAME_IDR || type == UNIT_FRAME_NON_IDR;
+}
+
+/* Offset of the NAL header byte inside a parsed unit. parse_nal_units() always
+ * puts unit->ptr on the first byte of the Annex-B start code, so the header sits
+ * just past it: 3 bytes in for 00 00 01, 4 for 00 00 00 01. */
+static gsize nal_header_offset(const nal_unit_t *unit) {
+    return (unit->len >= 3 && unit->ptr[2] == 0x01) ? 3 : 4;
+}
+
+/* TRUE when this slice NAL opens a new picture - the AU boundary signal used
+ * when the device emits no Access Unit Delimiter.
+ *
+ * H.264 slice headers start with first_mb_in_slice, H.265 slice segment headers
+ * with first_slice_segment_in_pic_flag; either way the "this is the first slice"
+ * condition is carried by the very first bit of the slice payload. An exp-Golomb
+ * ue(v) of 0 is coded as the single bit `1`, and the H.265 flag is a raw u(1), so
+ * both reduce to "the top bit of the first payload byte is set" - no bit reader
+ * needed. Emulation prevention cannot disturb that byte either: a 0x03 is only
+ * inserted after two 0x00 bytes, and the NAL header immediately preceding it is
+ * non-zero for every slice NAL. */
+static gboolean nal_opens_new_picture(enum uvc_frame_format format,
+                                      const nal_unit_t *unit) {
+    gsize payload = nal_header_offset(unit) +
+                    ((format == UVC_FRAME_FORMAT_H265) ? 2 : 1);
+    if (unit->len <= payload) return FALSE;
+    return (unit->ptr[payload] & 0x80) != 0;
+}
+
+/* Partition `units` into access units, writing the index of each AU's first unit
+ * into `starts` and returning the number of AUs found. AU k spans
+ * [starts[k], starts[k+1]), the last one running to `count`.
+ *
+ * Two boundary signals, in priority order:
+ *   AUD present  the delimiter IS the first NAL of its access unit, so it is an
+ *                exact boundary - no heuristic involved.
+ *   AUD absent   the standard fallback: a slice that opens a new picture ends the
+ *                AU that already holds one. Any non-VCL run immediately before
+ *                that slice (SEI, parameter sets) belongs to the NEW access unit,
+ *                so the cut is placed at the head of that run, not at the slice.
+ *
+ * A device that emits neither an AUD nor a decodable first-slice bit simply never
+ * splits, which degrades to the whole delivery as one AU - the same grouping a
+ * single-picture frame gets, and never a mid-picture cut. */
+gsize split_access_units(enum uvc_frame_format format,
+                         const nal_unit_t *units, gsize count,
+                         gsize *starts, gsize max_starts) {
+    gsize n = 0;
+    gboolean au_has_slice = FALSE;
+    gsize nonvcl_run = G_MAXSIZE;   /* first non-VCL NAL after the last slice */
+
+    for (gsize i = 0; i < count; i++) {
+        gboolean is_slice = nal_is_slice(units[i].type);
+        gboolean boundary = TRUE;
+        gsize at = i;
+
+        if (n == 0) {
+            at = 0;
+        } else if (units[i].type == UNIT_AUD) {
+            at = i;
+        } else if (is_slice && au_has_slice && nal_opens_new_picture(format, &units[i])) {
+            at = (nonvcl_run != G_MAXSIZE) ? nonvcl_run : i;
+        } else {
+            boundary = FALSE;
+        }
+
+        if (boundary) {
+            if (n >= max_starts) {
+                GST_WARNING("Access-unit count exceeds max=%" G_GSIZE_FORMAT
+                            "; stored %" G_GSIZE_FORMAT " and merged the remainder "
+                            "into the last one. Size the array with the NAL count.",
+                            max_starts, n);
+                break;
+            }
+            starts[n++] = at;
+            au_has_slice = FALSE;
+        }
+
+        if (is_slice) {
+            au_has_slice = TRUE;
+            nonvcl_run = G_MAXSIZE;
+        } else if (nonvcl_run == G_MAXSIZE) {
+            nonvcl_run = i;
+        }
+    }
+
+    return n;
+}
+
+/* Latch one parameter set into the element's cache.
+ *
+ * An oversized or empty set is refused outright (heap-overflow guard against the
+ * fixed SPSPPSBUFSZ arrays), and the cached copy is rewritten only when it
+ * actually CHANGED (L10): SPS/PPS/VPS repeat before every IDR, so an
+ * unconditional store rewrites the disk cache each GOP and wears the flash for
+ * nothing. send_sps_pps latches on every set regardless, so the parameter sets
+ * are always re-prepended in band even when the cache write is skipped. */
+static void cache_parameter_set(GstLibuvcH264Src *self, const nal_unit_t *unit,
+                                gboolean *updated) {
+    unsigned char *dst;
+    gint *dst_len;
+    const char *label;
+
+    switch (unit->type) {
+        case UNIT_VPS: dst = self->vps; dst_len = &self->vps_length; label = "VPS"; break;
+        case UNIT_SPS: dst = self->sps; dst_len = &self->sps_length; label = "SPS"; break;
+        case UNIT_PPS: dst = self->pps; dst_len = &self->pps_length; label = "PPS"; break;
+        default: return;
+    }
+
+    if (unit->len == 0 || unit->len > SPSPPSBUFSZ) {
+        GST_WARNING_OBJECT(self, "Dropping oversized/invalid %s NAL (%" G_GSIZE_FORMAT
+            " bytes; max %d) to prevent heap overflow", label, unit->len, SPSPPSBUFSZ);
+        return;
+    }
+
+    if ((gsize)*dst_len != unit->len || memcmp(dst, unit->ptr, unit->len) != 0) {
+        *dst_len = (gint)unit->len;
+        memcpy(dst, unit->ptr, unit->len);
+        *updated = TRUE;
+    }
+    self->send_sps_pps = TRUE;
+}
+
 void frame_callback(uvc_frame_t *frame, void *ptr) {
     GstLibuvcH264Src *self = (GstLibuvcH264Src *)ptr;
 
@@ -182,99 +315,83 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
     nal_unit_t *units = g_new(nal_unit_t, unit_count ? unit_count : 1);
     gsize c = parse_nal_units(self->frame_format, units, unit_count, data, data_bytes);
 
-    for (gsize i = 0; i < c; i++) {
-        nal_unit_t *unit = &units[i];
-        GstBuffer *buffer = NULL;
-        gsize buffer_offset = 0;
+    /* ONE GstBuffer per ACCESS UNIT, never per NAL. The pad template advertises
+       alignment=au, and every downstream consumer that trusts it (h264parse, the
+       V4L2/MPP decoders) mis-frames a picture whose slices arrive as separate
+       buffers. Single-slice 1080p is unaffected - its access unit is one slice,
+       so the emitted bytes are identical to the per-NAL path - but a multi-slice
+       or 4K picture used to be split across a dozen buffers all claiming to be
+       whole access units. */
+    gsize *au_starts = g_new(gsize, c ? c : 1);
+    gsize au_count = split_access_units(self->frame_format, units, c, au_starts, c);
 
-        switch (unit->type) {
-            case UNIT_VPS:
-                if (unit->len == 0 || unit->len > SPSPPSBUFSZ) {
-                    GST_WARNING_OBJECT(self, "Dropping oversized/invalid VPS NAL "
-                        "(%" G_GSIZE_FORMAT " bytes; max %d) to prevent heap overflow",
-                        unit->len, SPSPPSBUFSZ);
-                    continue;
-                }
-                // L10: only flag a disk write when the parameter set actually
-                // changed. SPS/PPS/VPS repeat before every IDR, so an
-                // unconditional store rewrites the cache file each GOP and wears
-                // the flash for nothing. send_sps_pps still latches every time so
-                // the sets are re-prepended in-band; only the cache write is gated.
-                if ((gsize)self->vps_length != unit->len ||
-                    memcmp(self->vps, unit->ptr, unit->len) != 0) {
-                    self->vps_length = unit->len;
-                    memcpy(self->vps, unit->ptr, self->vps_length);
-                    updated_sps_pps = TRUE;
-                }
-                self->send_sps_pps = TRUE;
-                continue;
-            case UNIT_SPS:
-                if (unit->len == 0 || unit->len > SPSPPSBUFSZ) {
-                    GST_WARNING_OBJECT(self, "Dropping oversized/invalid SPS NAL "
-                        "(%" G_GSIZE_FORMAT " bytes; max %d) to prevent heap overflow",
-                        unit->len, SPSPPSBUFSZ);
-                    continue;
-                }
-                if ((gsize)self->sps_length != unit->len ||
-                    memcmp(self->sps, unit->ptr, unit->len) != 0) {
-                    self->sps_length = unit->len;
-                    memcpy(self->sps, unit->ptr, self->sps_length);
-                    updated_sps_pps = TRUE;
-                }
-                self->send_sps_pps = TRUE;
-                continue;
-            case UNIT_PPS:
-                if (unit->len == 0 || unit->len > SPSPPSBUFSZ) {
-                    GST_WARNING_OBJECT(self, "Dropping oversized/invalid PPS NAL "
-                        "(%" G_GSIZE_FORMAT " bytes; max %d) to prevent heap overflow",
-                        unit->len, SPSPPSBUFSZ);
-                    continue;
-                }
-                if ((gsize)self->pps_length != unit->len ||
-                    memcmp(self->pps, unit->ptr, unit->len) != 0) {
-                    self->pps_length = unit->len;
-                    memcpy(self->pps, unit->ptr, self->pps_length);
-                    updated_sps_pps = TRUE;
-                }
-                self->send_sps_pps = TRUE;
-                continue;
-            case UNIT_FRAME_IDR: {
-                if (!self->had_idr || self->send_sps_pps) {
-                    buffer_offset = self->sps_length + self->pps_length;
-                    if (self->frame_format == UVC_FRAME_FORMAT_H265) {
-                        buffer_offset += self->vps_length;
-                    }
+    for (gsize a = 0; a < au_count; a++) {
+        gsize first = au_starts[a];
+        gsize end = (a + 1 < au_count) ? au_starts[a + 1] : c;
 
-                    buffer = gst_buffer_new_allocate(NULL, buffer_offset + unit->len, NULL);
-                    int offset = 0;
-                    if (self->frame_format == UVC_FRAME_FORMAT_H265) {
-                        gst_buffer_fill(buffer, offset, self->vps, self->vps_length);
-                        offset += self->vps_length;
-                    }
-                    gst_buffer_fill(buffer, offset, self->sps, self->sps_length);
-                    offset += self->sps_length;
-
-                    gst_buffer_fill(buffer, offset, self->pps, self->pps_length);
-                    self->send_sps_pps = FALSE;
-                }
-                if (!self->had_idr) {
-                    self->had_idr = TRUE;
-                }
-                break;
+        /* Consume this AU's parameter sets into the cache and measure what is
+           left to forward. Parameter sets are never forwarded from the wire; the
+           cached copy is re-prepended in front of the AU's first IDR below. */
+        gboolean has_idr = FALSE;
+        gboolean has_slice = FALSE;
+        gsize payload_len = 0;
+        for (gsize i = first; i < end; i++) {
+            nal_unit_t *unit = &units[i];
+            if (nal_is_parameter_set(unit->type)) {
+                cache_parameter_set(self, unit, &updated_sps_pps);
+                continue;
             }
-            default:
-                if (!self->had_idr) {
-                    continue;
-                }
+            if (unit->type == UNIT_FRAME_IDR) has_idr = TRUE;
+            if (nal_is_slice(unit->type)) has_slice = TRUE;
+            payload_len += unit->len;
         }
 
-        if (!buffer) {
-          buffer = gst_buffer_new_allocate(NULL, unit->len, NULL);
+        /* Drop everything ahead of the first keyframe so downstream never sees an
+           undecodable leading fragment, and drop an AU that carried nothing but
+           parameter sets. */
+        if ((!self->had_idr && !has_idr) || payload_len == 0) {
+            continue;
         }
-        gst_buffer_fill(buffer, buffer_offset, unit->ptr, unit->len);
+
+        gsize prefix_len = 0;
+        if (has_idr && (!self->had_idr || self->send_sps_pps)) {
+            prefix_len = (gsize)self->sps_length + (gsize)self->pps_length;
+            if (self->frame_format == UVC_FRAME_FORMAT_H265) {
+                prefix_len += (gsize)self->vps_length;
+            }
+        }
+
+        GstBuffer *buffer = gst_buffer_new_allocate(NULL, prefix_len + payload_len, NULL);
+        gsize at = 0;
+        gboolean prefixed = FALSE;
+        for (gsize i = first; i < end; i++) {
+            nal_unit_t *unit = &units[i];
+            if (nal_is_parameter_set(unit->type)) continue;
+
+            /* The cached parameter sets go immediately BEFORE the AU's first IDR
+               slice, never at the head of the buffer: an AUD, when present, must
+               remain the very first NAL of its access unit. */
+            if (!prefixed && prefix_len > 0 && unit->type == UNIT_FRAME_IDR) {
+                if (self->frame_format == UVC_FRAME_FORMAT_H265) {
+                    gst_buffer_fill(buffer, at, self->vps, self->vps_length);
+                    at += self->vps_length;
+                }
+                gst_buffer_fill(buffer, at, self->sps, self->sps_length);
+                at += self->sps_length;
+                gst_buffer_fill(buffer, at, self->pps, self->pps_length);
+                at += self->pps_length;
+                prefixed = TRUE;
+                self->send_sps_pps = FALSE;
+            }
+            gst_buffer_fill(buffer, at, unit->ptr, unit->len);
+            at += unit->len;
+        }
+        if (has_idr) {
+            self->had_idr = TRUE;
+        }
 
         // Set timestamps on the buffer
-        if (units[i].type == UNIT_FRAME_IDR || units[i].type == UNIT_FRAME_NON_IDR) {
+        if (has_slice) {
             /* The problems:
                * libuvc capture timestamps are jittery
                * video players skip and duplicate frames if the PTSes are noisy
@@ -303,7 +420,7 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
 
             // Update the PTS calculation on the first IDR after MIN_FRAMES_CALC_INTERVAL frames
             self->frame_count++;
-            gboolean update_pts_calc = (units[i].type == UNIT_FRAME_IDR &&
+            gboolean update_pts_calc = (has_idr &&
                                         self->frame_count >= MIN_FRAMES_CALC_INTERVAL);
 
             int64_t timestamp_offset = 0;
@@ -396,7 +513,7 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
             GST_LOG_OBJECT(self, "PTS %lu, offset %ld us", timestamp, offset / 1000);
         }
 
-        // Monotonic frame counter so downstream can detect drops. Only the
+        // Monotonic access-unit counter so downstream can detect drops. Only the
         // feeder thread runs frame_callback, so this needs no lock.
         GST_BUFFER_OFFSET(buffer) = self->frame_offset;
         GST_BUFFER_OFFSET_END(buffer) = self->frame_offset + 1;
@@ -405,6 +522,7 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
         g_async_queue_push(self->frame_queue, buffer);
     }
 
+    g_free(au_starts);
     g_free(units);
 
     if (updated_sps_pps) {
