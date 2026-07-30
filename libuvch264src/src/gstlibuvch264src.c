@@ -257,6 +257,18 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
     gboolean result = FALSE;
     gboolean found_codec_format = FALSE;
 
+    // vid:pid quirk seam (A14), resolved BEFORE the selection loop because a quirk
+    // can rule advertised-but-undeliverable modes OUT of the selection, not just
+    // change how the winning mode is probed. A device with no row gets zeroed
+    // limits, which impose nothing.
+    uvc_quirk_limits_t quirk_limits = {0};
+    uvc_device_descriptor_t *quirk_desc = NULL;
+    if (uvc_get_device_descriptor(self->uvc_dev, &quirk_desc) == UVC_SUCCESS
+        && quirk_desc != NULL) {
+        uvc_quirks_limits(quirk_desc->idVendor, quirk_desc->idProduct, &quirk_limits);
+        uvc_free_device_descriptor(quirk_desc);
+    }
+
     // Enumerate supported H264 / H265 resolutions and framerates
     // And select the highest compatible resolution, at the highest supported framerate
     for (const uvc_format_desc_t *format_desc = uvc_get_format_descs(self->uvc_devh);
@@ -286,8 +298,19 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
                 GValue framerates = G_VALUE_INIT;
                 g_value_init(&framerates, GST_TYPE_LIST);
 
+                guint excluded = 0;
                 for (const uint32_t *interval = frame_desc->intervals; *interval; interval++) {
                     gint _fps = 1e7 / *interval;
+
+                    // A quirked device advertises rates it cannot deliver. Drop
+                    // them here, before they can win the preference below OR reach
+                    // the caps we publish downstream.
+                    if (!uvc_quirk_mode_selectable(&quirk_limits, frame_desc->wWidth,
+                                                   frame_desc->wHeight, (guint)_fps)) {
+                        excluded++;
+                        continue;
+                    }
+
                     if (_fps > fps) {
                         fps = _fps;
                     }
@@ -297,6 +320,20 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
                     gst_value_set_fraction(&fps, (gint)_fps, 1);
                     gst_value_list_append_value(&framerates, &fps);
                     g_value_unset(&fps);
+                }
+
+                if (excluded > 0) {
+                    GST_INFO_OBJECT(self,
+                        "quirk: dropped %u non-deliverable rate(s) at %ux%u",
+                        excluded, frame_desc->wWidth, frame_desc->wHeight);
+                }
+
+                if (fps < 0) {
+                    // Every rate this descriptor advertises is above the cap, so
+                    // the whole mode is unusable; an empty framerate list would
+                    // otherwise fixate to nothing.
+                    g_value_unset(&framerates);
+                    continue;
                 }
 
                 // gst_structure_set_value() copies the list, so the local GValue
@@ -314,8 +351,24 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
                     continue;
                 }
                 gint fps_min = 1e7 / frame_desc->dwMaxFrameInterval;
-                gint fps = 1e7 / frame_desc->dwMinFrameInterval;
-                gst_structure_set(tmp_structure, "framerate", GST_TYPE_FRACTION_RANGE, fps_min, 1, fps, 1, NULL);
+                gint fps_max = 1e7 / frame_desc->dwMinFrameInterval;
+
+                // Same quirk cap as the discrete branch, applied to the top of the
+                // range instead of to a list. If even the slowest rate is over the
+                // cap the whole descriptor goes.
+                guint fps_cap = uvc_quirk_max_fps(&quirk_limits, frame_desc->wWidth,
+                                                  frame_desc->wHeight);
+                if ((guint)fps_max > fps_cap) {
+                    fps_max = (gint)fps_cap;
+                }
+                if (fps_max < fps_min) {
+                    GST_INFO_OBJECT(self,
+                        "quirk: %ux%u dropped, its whole interval range exceeds the cap",
+                        frame_desc->wWidth, frame_desc->wHeight);
+                    continue;
+                }
+
+                gst_structure_set(tmp_structure, "framerate", GST_TYPE_FRACTION_RANGE, fps_min, 1, fps_max, 1, NULL);
             }
 
             if (gst_caps_can_intersect(caps, tmp_caps)) {
@@ -364,19 +417,10 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
         goto out;
     }
 
-    // vid:pid quirk seam (A14). The production table ships empty, so
-    // uvc_quirks_lookup() returns 0 for every device and the probe count below
-    // is unchanged; a matching entry can request QUIRK_DOUBLE_PROBE (libuvc #242)
-    // to issue the format-size probe twice, discarding the first result.
-    guint32 quirks = 0;
-    uvc_device_descriptor_t *quirk_desc = NULL;
-    if (uvc_get_device_descriptor(self->uvc_dev, &quirk_desc) == UVC_SUCCESS
-        && quirk_desc != NULL) {
-        quirks = uvc_quirks_lookup(quirk_desc->idVendor, quirk_desc->idProduct);
-        uvc_free_device_descriptor(quirk_desc);
-    }
-
-    if (quirks & QUIRK_DOUBLE_PROBE) {
+    // Reuses the flags resolved above the selection loop: a device with no row has
+    // none set and the probe count stays at 1. QUIRK_DOUBLE_PROBE (libuvc #242)
+    // issues the format-size probe twice, discarding the first result.
+    if (quirk_limits.flags & QUIRK_DOUBLE_PROBE) {
         // Some devices return a stale/rejected stream control on the first
         // probe; run it once and discard the result before the real probe.
         uvc_get_stream_ctrl_format_size(self->uvc_devh, &self->uvc_ctrl,
