@@ -29,6 +29,7 @@ enum {
   PROP_CONTROL_SOCKET,
   PROP_CONTROL_SOCKET_PATH,
   PROP_RECONNECT,
+  PROP_WARMUP_FRAMES,
   PROP_LAST
 };
 
@@ -39,6 +40,8 @@ enum {
 
 /* Opt-in in-element reconnect: bounded exponential backoff 1,2,4,8,16 s. */
 #define RECONNECT_MAX_RETRIES 5
+/* Upper bound for warmup-frames: two minutes at 30 fps. */
+#define WARMUP_FRAMES_MAX 3600
 #define RECONNECT_BACKOFF_INITIAL_S 1
 
 /* Frames a port-reset recovery must deliver before the one-shot re-arms. ~1 s at
@@ -144,6 +147,17 @@ static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
                          "device disconnects mid-stream",
                          FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  /* DJI cameras (Pocket 3, Action 4/5) emit unstable frames for about a second
+   * after the stream starts. Those frames are discarded before the keyframe
+   * gate in frame_callback(), so the first forwarded frame is still an IDR with
+   * the parameter sets in front of it. */
+  g_object_class_install_property(gobject_class, PROP_WARMUP_FRAMES,
+    g_param_spec_uint("warmup-frames", "Warmup frames",
+                      "Frames to discard each time the stream starts or "
+                      "reconnects, for cameras whose first frames are unstable",
+                      0, WARMUP_FRAMES_MAX, 0,
+                      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   /* Action signal driving all three axes in one emission; each axis is applied
    * only when the device supports it (gated in ptz_control.c). */
   g_signal_new_class_handler("set-ptz", G_TYPE_FROM_CLASS(klass),
@@ -180,6 +194,7 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->reset_recovery_used = FALSE;
   self->frames_since_reset = 0;
   self->reconnect_enabled = FALSE;
+  self->warmup_frames = 0;
   self->frame_offset = 0;
   self->base_time = G_MAXUINT64;
   self->prev_pts = G_MAXUINT64;
@@ -520,6 +535,9 @@ static void gst_libuvc_h264_src_set_property(GObject *object, guint prop_id,
     case PROP_RECONNECT:
       self->reconnect_enabled = g_value_get_boolean(value);
       break;
+    case PROP_WARMUP_FRAMES:
+      self->warmup_frames = g_value_get_uint(value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
       break;
@@ -551,6 +569,9 @@ static void gst_libuvc_h264_src_get_property(GObject *object, guint prop_id,
       break;
     case PROP_RECONNECT:
       g_value_set_boolean(value, self->reconnect_enabled);
+      break;
+    case PROP_WARMUP_FRAMES:
+      g_value_set_uint(value, self->warmup_frames);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
@@ -775,6 +796,7 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   // frame_callback() and create() test for.
   self->had_idr = FALSE;
   self->send_sps_pps = FALSE;
+  self->warmup_remaining = self->warmup_frames;
   self->frame_count = 0;
   self->frame_offset = 0;
   self->prev_int_ts = 0;
@@ -1089,6 +1111,7 @@ static gboolean gst_libuvc_h264_src_reconnect_bounded(GstLibuvcH264Src *self,
     // re-latch the PTS baseline and re-engage the IDR gate after the gap.
     self->had_idr = FALSE;
     self->send_sps_pps = FALSE;
+    self->warmup_remaining = self->warmup_frames;
     self->base_time = G_MAXUINT64;
     self->prev_pts = G_MAXUINT64;
 

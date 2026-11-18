@@ -61,6 +61,11 @@ struct _GstLibuvcH264Src {
   guint64 frame_offset;
   gboolean had_idr;
   gboolean send_sps_pps;
+  guint warmup_frames;    /* PROP_WARMUP_FRAMES */
+  /* Pictures still to discard in this session. Re-armed from warmup_frames
+   * wherever had_idr is, before the feeder starts; then only the feeder thread
+   * touches it. */
+  guint warmup_remaining;
   gint vps_length;
   gint sps_length;
   gint pps_length;

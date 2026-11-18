@@ -346,6 +346,14 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
             payload_len += unit->len;
         }
 
+        /* warmup-frames: discard the camera's first pictures before the
+           keyframe gate below, so had_idr stays FALSE and the first picture
+           forwarded afterwards is an IDR with the cached parameter sets. */
+        if (has_slice && self->warmup_remaining > 0) {
+            self->warmup_remaining--;
+            continue;
+        }
+
         /* Drop everything ahead of the first keyframe so downstream never sees an
            undecodable leading fragment, and drop an AU that carried nothing but
            parameter sets. */
