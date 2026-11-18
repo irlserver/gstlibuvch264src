@@ -19,11 +19,15 @@ nal_unit_type_t convert_unit_type(enum uvc_frame_format format, int type) {
       }
 
     } else if (format == UVC_FRAME_FORMAT_H265) {
+        /* Every VCL type ITU-T H.265 Table 7-1 defines is a slice of a coded
+           picture: 0 to 9 (trailing, TSA, STSA, RADL, RASL) and 16 to 21 (BLA,
+           IDR, CRA). Both IDR types (19 IDR_W_RADL, the one most hardware
+           encoders emit, and 20 IDR_N_LP) start a stream that decodes on its
+           own. The reserved types stay invalid. */
+        if ((type >= 0 && type <= 9) || (type >= 16 && type <= 21)) {
+            return (type == 19 || type == 20) ? UNIT_FRAME_IDR : UNIT_FRAME_NON_IDR;
+        }
         switch (type) {
-            case 1:
-                return UNIT_FRAME_NON_IDR;
-            case 20:
-                return UNIT_FRAME_IDR;
             case 32:
                 return UNIT_VPS;
             case 33:
