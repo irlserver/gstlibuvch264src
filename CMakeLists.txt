@@ -55,8 +55,7 @@ else()
     GIT_REPOSITORY https://github.com/libuvc/libuvc.git
     # Pinned to the v0.0.7 commit SHA (tags are mutable). Keep in sync with the Dockerfile.
     GIT_TAG 68d07a00e11d1944e27b7295ee69673239c00b4b
-    PATCH_COMMAND patch -p1 < ${CMAKE_CURRENT_SOURCE_DIR}/patches/uvc15-support.patch
-      && patch -p1 < ${CMAKE_CURRENT_SOURCE_DIR}/patches/libuvc-h265-support.patch
+    PATCH_COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/patches/apply.sh
     UPDATE_DISCONNECTED 1
   )
   FetchContent_MakeAvailable(libuvc)
@@ -83,6 +82,7 @@ add_library(gstlibuvch264src MODULE
   libuvch264src/src/ptz_control.c
   libuvch264src/src/spspps_cache.c
   libuvch264src/src/gstlibuvch264src_error.c
+  libuvch264src/src/quirks.c
 )
 set_target_properties(gstlibuvch264src PROPERTIES
   PREFIX "lib"

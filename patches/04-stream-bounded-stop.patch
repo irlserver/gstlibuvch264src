@@ -1,0 +1,110 @@
+From 0a89e8703d8aacdd939d64dbc734d1fc462571bf Mon Sep 17 00:00:00 2001
+From: Andres Cera <Andres.cera@hotmail.com>
+Date: Thu, 2 Jul 2026 17:45:22 -0500
+Subject: [PATCH] fix(stream): bounded wait in uvc_stream_stop; return TIMEOUT
+ instead of hanging
+
+Adapt pupil-labs c534e3d + upstream PR #59 intent: the transfer-cancel
+wait loop in uvc_stream_stop() used an unbounded pthread_cond_wait, so a
+dead/unplugged device whose cancelled transfers never complete (a wedged
+event thread) hung the caller forever. Replace it with a bounded
+pthread_cond_timedwait (~1s per iteration, up to 5 attempts / ~5s total),
+mirroring the existing timedwait pattern in uvc_stream_get_frame, and
+return UVC_ERROR_TIMEOUT if cancellation never completes.
+
+The stream is already marked stopped (running=0) before the wait, so
+uvc_stream_close can proceed safely on timeout. Transfers still in flight
+are NOT freed here (preserves d3318ae): _uvc_stream_callback still owns
+the single free. The normal fast-cancel path is unchanged.
+
+(cherry picked from commit ab49e218369a62cc107d543a4f7aa9a08b02f10e)
+---
+ include/libuvc/libuvc_internal.h | 13 ++++++++++++
+ src/stream.c                     | 36 ++++++++++++++++++++++++++++++--
+ 2 files changed, 47 insertions(+), 2 deletions(-)
+
+diff --git a/include/libuvc/libuvc_internal.h b/include/libuvc/libuvc_internal.h
+index bdf42db..f3ae764 100644
+--- a/include/libuvc/libuvc_internal.h
++++ b/include/libuvc/libuvc_internal.h
+@@ -231,6 +231,19 @@ typedef struct uvc_device_info {
+ #endif
+ #endif
+ 
++/* Bound uvc_stream_stop()'s wait for transfer cancellation so a wedged event
++ * thread (e.g. a dead/unplugged device that never completes the cancelled
++ * transfers) cannot hang the caller forever. Each iteration waits at most
++ * LIBUVC_STREAM_STOP_TIMEOUT_SECS; after LIBUVC_STREAM_STOP_TIMEOUT_ATTEMPTS
++ * consecutive timeouts (~5s total) uvc_stream_stop returns UVC_ERROR_TIMEOUT.
++ */
++#ifndef LIBUVC_STREAM_STOP_TIMEOUT_SECS
++#define LIBUVC_STREAM_STOP_TIMEOUT_SECS 1
++#endif
++#ifndef LIBUVC_STREAM_STOP_TIMEOUT_ATTEMPTS
++#define LIBUVC_STREAM_STOP_TIMEOUT_ATTEMPTS 5
++#endif
++
+ #define LIBUVC_XFER_META_BUF_SIZE ( 4 * 1024 )
+ 
+ struct uvc_stream_handle {
+diff --git a/src/stream.c b/src/stream.c
+index 3f3752f..1ebfa6d 100644
+--- a/src/stream.c
++++ b/src/stream.c
+@@ -1496,6 +1496,9 @@ void uvc_stop_streaming(uvc_device_handle_t *devh) {
+  */
+ uvc_error_t uvc_stream_stop(uvc_stream_handle_t *strmh) {
+   int i;
++  uvc_error_t ret = UVC_SUCCESS;
++  int timeout_attempts = 0;
++  struct timespec ts;
+ 
+   if (!strmh->running)
+     return UVC_ERROR_INVALID_PARAM;
+@@ -1520,7 +1523,36 @@ uvc_error_t uvc_stream_stop(uvc_stream_handle_t *strmh) {
+     }
+     if(i == LIBUVC_NUM_TRANSFER_BUFS )
+       break;
+-    pthread_cond_wait(&strmh->cb_cond, &strmh->cb_mutex);
++
++    /* Bounded wait (mirrors uvc_stream_get_frame's timedwait): a dead device's
++     * cancelled transfers can fail to complete, so a plain pthread_cond_wait
++     * here hangs the caller forever. Wait at most LIBUVC_STREAM_STOP_TIMEOUT_SECS
++     * per iteration; give up after LIBUVC_STREAM_STOP_TIMEOUT_ATTEMPTS timeouts.
++     * The stream is already marked stopped (running=0 above) so uvc_stream_close
++     * can proceed, and in-flight transfers are still left for _uvc_stream_callback
++     * to free (never freed here). */
++    ts.tv_sec = 0;
++    ts.tv_nsec = 0;
++
++#if _POSIX_TIMERS > 0
++    clock_gettime(CLOCK_REALTIME, &ts);
++#else
++    {
++      struct timeval tv;
++      gettimeofday(&tv, NULL);
++      ts.tv_sec = tv.tv_sec;
++      ts.tv_nsec = tv.tv_usec * 1000;
++    }
++#endif
++
++    ts.tv_sec += LIBUVC_STREAM_STOP_TIMEOUT_SECS;
++
++    if (pthread_cond_timedwait(&strmh->cb_cond, &strmh->cb_mutex, &ts) == ETIMEDOUT) {
++      if (++timeout_attempts >= LIBUVC_STREAM_STOP_TIMEOUT_ATTEMPTS) {
++        ret = UVC_ERROR_TIMEOUT;
++        break;
++      }
++    }
+   } while(1);
+   // Kick the user thread awake
+   pthread_cond_broadcast(&strmh->cb_cond);
+@@ -1534,7 +1566,7 @@ uvc_error_t uvc_stream_stop(uvc_stream_handle_t *strmh) {
+     pthread_join(strmh->cb_thread, NULL);
+   }
+ 
+-  return UVC_SUCCESS;
++  return ret;
+ }
+ 
+ /** @brief Close stream.

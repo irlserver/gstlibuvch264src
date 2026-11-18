@@ -14,6 +14,8 @@ sources = [
   'spspps_cache.h',
   'gstlibuvch264src_error.c',
   'gstlibuvch264src_error.h',
+  'quirks.c',
+  'quirks.h',
 ]
 
 shared_library(library_name, sources,

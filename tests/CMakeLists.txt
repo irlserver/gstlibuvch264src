@@ -83,6 +83,7 @@ set(_element_srcs
   ${CMAKE_SOURCE_DIR}/libuvch264src/src/ptz_control.c
   ${CMAKE_SOURCE_DIR}/libuvch264src/src/spspps_cache.c
   ${CMAKE_SOURCE_DIR}/libuvch264src/src/gstlibuvch264src_error.c
+  ${CMAKE_SOURCE_DIR}/libuvch264src/src/quirks.c
 )
 
 # add_mock_harness_variant(<variant> <sanitizer>)

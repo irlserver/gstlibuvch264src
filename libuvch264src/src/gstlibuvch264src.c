@@ -13,8 +13,10 @@
 #include "frame_pipeline.h"
 #include "spspps_cache.h"
 #include "ptz_control.h"
+#include "quirks.h"
 #include <gst/gst.h>
 #include <libuvc/libuvc.h>
+#include <libusb-1.0/libusb.h>
 
 GST_DEBUG_CATEGORY(gst_libuvc_h264_src_debug);
 
@@ -27,6 +29,7 @@ enum {
   PROP_CONTROL_SOCKET,
   PROP_CONTROL_SOCKET_PATH,
   PROP_RECONNECT,
+  PROP_WARMUP_FRAMES,
   PROP_LAST
 };
 
@@ -37,7 +40,19 @@ enum {
 
 /* Opt-in in-element reconnect: bounded exponential backoff 1,2,4,8,16 s. */
 #define RECONNECT_MAX_RETRIES 5
+/* Upper bound for warmup-frames: two minutes at 30 fps. */
+#define WARMUP_FRAMES_MAX 3600
 #define RECONNECT_BACKOFF_INITIAL_S 1
+
+/* Frames a port-reset recovery must deliver before the one-shot re-arms. ~1 s at
+ * 30 fps: enough to distinguish a device that genuinely came back from one that
+ * emits a frame and immediately re-wedges (which would otherwise reset forever). */
+#define RESET_RECOVERY_REARM_FRAMES 30
+/* Settle window between a USB port reset and the reopen. MEASURED on a DJI Osmo
+ * Pocket 3: a reopen ~1 s after the reset succeeds but yields zero frames; the
+ * device needs several seconds to re-enumerate and re-arm its streaming
+ * endpoint. Interruptible, so it never delays a NULL/PAUSED transition. */
+#define RESET_SETTLE_MS 4000
 
 #define H264_CAPS "video/x-h264," \
                   "stream-format=(string)byte-stream," \
@@ -132,6 +147,17 @@ static void gst_libuvc_h264_src_class_init(GstLibuvcH264SrcClass *klass) {
                          "device disconnects mid-stream",
                          FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  /* DJI cameras (Pocket 3, Action 4/5) emit unstable frames for about a second
+   * after the stream starts. Those frames are discarded before the keyframe
+   * gate in frame_callback(), so the first forwarded frame is still an IDR with
+   * the parameter sets in front of it. */
+  g_object_class_install_property(gobject_class, PROP_WARMUP_FRAMES,
+    g_param_spec_uint("warmup-frames", "Warmup frames",
+                      "Frames to discard each time the stream starts or "
+                      "reconnects, for cameras whose first frames are unstable",
+                      0, WARMUP_FRAMES_MAX, 0,
+                      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   /* Action signal driving all three axes in one emission; each axis is applied
    * only when the device supports it (gated in ptz_control.c). */
   g_signal_new_class_handler("set-ptz", G_TYPE_FROM_CLASS(klass),
@@ -165,7 +191,10 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
   self->streaming = FALSE;
   self->flushing = 0;
   self->consecutive_timeouts = 0;
+  self->reset_recovery_used = FALSE;
+  self->frames_since_reset = 0;
   self->reconnect_enabled = FALSE;
+  self->warmup_frames = 0;
   self->frame_offset = 0;
   self->base_time = G_MAXUINT64;
   self->prev_pts = G_MAXUINT64;
@@ -188,6 +217,34 @@ static void gst_libuvc_h264_src_init(GstLibuvcH264Src *self) {
 
   gst_base_src_set_live(GST_BASE_SRC(self), TRUE);
   gst_base_src_set_format(GST_BASE_SRC(self), GST_FORMAT_TIME);
+}
+
+/* Log a full inventory of every format/frame descriptor the device advertises.
+ * Called from negotiate() right before the no-H264/H265 bus error so field
+ * triage (GST_DEBUG=libuvch264src:3) can see WHAT the camera actually offered -
+ * fourcc/guid plus each frame's resolution and interval range - when it exposes
+ * no codec the element can stream. */
+static void gst_libuvc_h264_src_log_format_inventory(GstLibuvcH264Src *self) {
+    for (const uvc_format_desc_t *format_desc = uvc_get_format_descs(self->uvc_devh);
+         format_desc; format_desc = format_desc->next)
+    {
+        const guint8 *g = format_desc->guidFormat;
+        GST_WARNING_OBJECT(self,
+            "  format fourcc '%.4s' guid "
+            "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+            format_desc->fourccFormat,
+            g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7],
+            g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
+
+        for (const uvc_frame_desc_t *frame_desc = format_desc->frame_descs;
+             frame_desc; frame_desc = frame_desc->next)
+        {
+            GST_WARNING_OBJECT(self,
+                "    %ux%u frame interval [%u..%u] (100ns units)",
+                frame_desc->wWidth, frame_desc->wHeight,
+                frame_desc->dwMinFrameInterval, frame_desc->dwMaxFrameInterval);
+        }
+    }
 }
 
 static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
@@ -214,6 +271,18 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
     GstCaps *best_caps = NULL;
     gboolean result = FALSE;
     gboolean found_codec_format = FALSE;
+
+    // vid:pid quirk seam (A14), resolved BEFORE the selection loop because a quirk
+    // can rule advertised-but-undeliverable modes OUT of the selection, not just
+    // change how the winning mode is probed. A device with no row gets zeroed
+    // limits, which impose nothing.
+    uvc_quirk_limits_t quirk_limits = {0};
+    uvc_device_descriptor_t *quirk_desc = NULL;
+    if (uvc_get_device_descriptor(self->uvc_dev, &quirk_desc) == UVC_SUCCESS
+        && quirk_desc != NULL) {
+        uvc_quirks_limits(quirk_desc->idVendor, quirk_desc->idProduct, &quirk_limits);
+        uvc_free_device_descriptor(quirk_desc);
+    }
 
     // Enumerate supported H264 / H265 resolutions and framerates
     // And select the highest compatible resolution, at the highest supported framerate
@@ -244,8 +313,19 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
                 GValue framerates = G_VALUE_INIT;
                 g_value_init(&framerates, GST_TYPE_LIST);
 
+                guint excluded = 0;
                 for (const uint32_t *interval = frame_desc->intervals; *interval; interval++) {
                     gint _fps = 1e7 / *interval;
+
+                    // A quirked device advertises rates it cannot deliver. Drop
+                    // them here, before they can win the preference below OR reach
+                    // the caps we publish downstream.
+                    if (!uvc_quirk_mode_selectable(&quirk_limits, frame_desc->wWidth,
+                                                   frame_desc->wHeight, (guint)_fps)) {
+                        excluded++;
+                        continue;
+                    }
+
                     if (_fps > fps) {
                         fps = _fps;
                     }
@@ -255,6 +335,20 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
                     gst_value_set_fraction(&fps, (gint)_fps, 1);
                     gst_value_list_append_value(&framerates, &fps);
                     g_value_unset(&fps);
+                }
+
+                if (excluded > 0) {
+                    GST_INFO_OBJECT(self,
+                        "quirk: dropped %u non-deliverable rate(s) at %ux%u",
+                        excluded, frame_desc->wWidth, frame_desc->wHeight);
+                }
+
+                if (fps < 0) {
+                    // Every rate this descriptor advertises is above the cap, so
+                    // the whole mode is unusable; an empty framerate list would
+                    // otherwise fixate to nothing.
+                    g_value_unset(&framerates);
+                    continue;
                 }
 
                 // gst_structure_set_value() copies the list, so the local GValue
@@ -272,8 +366,24 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
                     continue;
                 }
                 gint fps_min = 1e7 / frame_desc->dwMaxFrameInterval;
-                gint fps = 1e7 / frame_desc->dwMinFrameInterval;
-                gst_structure_set(tmp_structure, "framerate", GST_TYPE_FRACTION_RANGE, fps_min, 1, fps, 1, NULL);
+                gint fps_max = 1e7 / frame_desc->dwMinFrameInterval;
+
+                // Same quirk cap as the discrete branch, applied to the top of the
+                // range instead of to a list. If even the slowest rate is over the
+                // cap the whole descriptor goes.
+                guint fps_cap = uvc_quirk_max_fps(&quirk_limits, frame_desc->wWidth,
+                                                  frame_desc->wHeight);
+                if ((guint)fps_max > fps_cap) {
+                    fps_max = (gint)fps_cap;
+                }
+                if (fps_max < fps_min) {
+                    GST_INFO_OBJECT(self,
+                        "quirk: %ux%u dropped, its whole interval range exceeds the cap",
+                        frame_desc->wWidth, frame_desc->wHeight);
+                    continue;
+                }
+
+                gst_structure_set(tmp_structure, "framerate", GST_TYPE_FRACTION_RANGE, fps_min, 1, fps_max, 1, NULL);
             }
 
             if (gst_caps_can_intersect(caps, tmp_caps)) {
@@ -303,9 +413,13 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
 
     if (!found_codec_format) {
         // The device exposes no H264/H265 format descriptor at all, so there is
-        // nothing to stream. Post a bus ERROR (not just a debug log) so
+        // nothing to stream. Log a full inventory of what it DID advertise first
+        // (field triage), then post a bus ERROR (not just a debug log) so
         // downstream consumers can react, instead of falling
         // through with uninitialized width/height/framerate.
+        GST_WARNING_OBJECT(self,
+            "device exposes no H264/H265 format; advertised formats follow:");
+        gst_libuvc_h264_src_log_format_inventory(self);
         gst_libuvc_h264_src_post_error(GST_ELEMENT(self), UVC_ERROR_NOT_SUPPORTED,
             "negotiating caps: device exposes no H264/H265 format");
         goto out;
@@ -316,6 +430,16 @@ static gboolean gst_libuvc_h264_negotiate(GstBaseSrc * basesrc) {
     if (width < 0 || height < 0 || framerate <= 0 || !best_caps) {
         GST_ERROR_OBJECT(self, "Unable to negotiate common caps");
         goto out;
+    }
+
+    // Reuses the flags resolved above the selection loop: a device with no row has
+    // none set and the probe count stays at 1. QUIRK_DOUBLE_PROBE (libuvc #242)
+    // issues the format-size probe twice, discarding the first result.
+    if (quirk_limits.flags & QUIRK_DOUBLE_PROBE) {
+        // Some devices return a stale/rejected stream control on the first
+        // probe; run it once and discard the result before the real probe.
+        uvc_get_stream_ctrl_format_size(self->uvc_devh, &self->uvc_ctrl,
+                                        self->frame_format, width, height, framerate);
     }
 
     int res = uvc_get_stream_ctrl_format_size(self->uvc_devh, &self->uvc_ctrl,
@@ -411,6 +535,9 @@ static void gst_libuvc_h264_src_set_property(GObject *object, guint prop_id,
     case PROP_RECONNECT:
       self->reconnect_enabled = g_value_get_boolean(value);
       break;
+    case PROP_WARMUP_FRAMES:
+      self->warmup_frames = g_value_get_uint(value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
       break;
@@ -442,6 +569,9 @@ static void gst_libuvc_h264_src_get_property(GObject *object, guint prop_id,
       break;
     case PROP_RECONNECT:
       g_value_set_boolean(value, self->reconnect_enabled);
+      break;
+    case PROP_WARMUP_FRAMES:
+      g_value_set_uint(value, self->warmup_frames);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
@@ -666,12 +796,15 @@ static gboolean gst_libuvc_h264_src_start(GstBaseSrc *src) {
   // frame_callback() and create() test for.
   self->had_idr = FALSE;
   self->send_sps_pps = FALSE;
+  self->warmup_remaining = self->warmup_frames;
   self->frame_count = 0;
   self->frame_offset = 0;
   self->prev_int_ts = 0;
   self->prev_pts = G_MAXUINT64;
   self->base_time = G_MAXUINT64;
   self->consecutive_timeouts = 0;
+  self->reset_recovery_used = FALSE;
+  self->frames_since_reset = 0;
 
   // Resolve the device selector up-front, before touching libuvc, so a
   // malformed index fails loudly here instead of silently selecting device 0.
@@ -888,7 +1021,8 @@ static gboolean gst_libuvc_h264_src_unlock_stop(GstBaseSrc *src) {
  * CRITICAL: never call gst_libuvc_h264_src_force_usb_release() here — the spike
  * proved force_usb_release()+uvc_close() double-closes the libusb handle. The
  * native uvc_stop_streaming()->uvc_close() owns the single libusb_close(). */
-static gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
+static gboolean gst_libuvc_h264_src_reconnect_bounded(GstLibuvcH264Src *self,
+                                                      gint max_retries) {
   GstLibuvcDeviceSelector selector = {0};
   const gchar *parse_err = NULL;
   if (!gst_libuvc_h264_src_parse_selector(self->index, &selector, &parse_err)) {
@@ -919,7 +1053,7 @@ static gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
   }
 
   guint backoff_s = RECONNECT_BACKOFF_INITIAL_S;
-  for (int attempt = 0; attempt < RECONNECT_MAX_RETRIES; attempt++) {
+  for (int attempt = 0; attempt < max_retries; attempt++) {
     // Interruptible backoff: bail at once if unlock() flagged a flush, so
     // teardown never blocks for the full (up to 16 s) backoff window.
     for (guint slept_ms = 0; slept_ms < backoff_s * 1000; slept_ms += 100) {
@@ -930,7 +1064,7 @@ static gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
     }
 
     GST_DEBUG_OBJECT(self, "Reconnect attempt %d/%d (after %u s backoff)",
-                     attempt + 1, RECONNECT_MAX_RETRIES, backoff_s);
+                     attempt + 1, max_retries, backoff_s);
     backoff_s *= 2;
 
     uvc_device_t **dev_list = NULL;
@@ -977,6 +1111,7 @@ static gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
     // re-latch the PTS baseline and re-engage the IDR gate after the gap.
     self->had_idr = FALSE;
     self->send_sps_pps = FALSE;
+    self->warmup_remaining = self->warmup_frames;
     self->base_time = G_MAXUINT64;
     self->prev_pts = G_MAXUINT64;
 
@@ -995,8 +1130,64 @@ static gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
   }
 
   GST_WARNING_OBJECT(self, "Reconnect exhausted after %d attempts",
-                     RECONNECT_MAX_RETRIES);
+                     max_retries);
   return FALSE;
+}
+
+static gboolean gst_libuvc_h264_src_reconnect(GstLibuvcH264Src *self) {
+  return gst_libuvc_h264_src_reconnect_bounded(self, RECONNECT_MAX_RETRIES);
+}
+
+/* Clear a WEDGED device: still enumerated, still answering every control
+ * transfer (descriptors, probe/commit, PTZ), yet delivering nothing on the
+ * streaming endpoint. Measured on a DJI Osmo Pocket 3 (2ca3:0023) after the
+ * holding process died without uvc_close(): the interface's alternate setting is
+ * never wound back, so the device stays armed for a host that is gone and
+ * refuses to stream for the next one. Reproduced identically through libuvc AND
+ * through the kernel uvcvideo driver, which is what proves it is device state
+ * rather than anything in this element.
+ *
+ * A close/reopen does NOT clear it (measured). A USB port reset does, every
+ * time. libusb_reset_device() issues exactly that, so the recovery needs no
+ * sysfs write and no privilege this process does not already have.
+ *
+ * LIBUSB_ERROR_NOT_FOUND is a SUCCESS for our purpose: libusb returns it when
+ * the reset re-enumerated the device, which is precisely the outcome we want.
+ * It only means the caller must reopen from a fresh enumeration, which is what
+ * gst_libuvc_h264_src_reconnect_bounded() does. Any other status means the port
+ * reset itself did not happen, so the device really is unreachable. */
+static gboolean gst_libuvc_h264_src_reset_silent_device(GstLibuvcH264Src *self) {
+  if (self->uvc_devh == NULL) {
+    return FALSE;
+  }
+  libusb_device_handle *usb_devh = uvc_get_libusb_handle(self->uvc_devh);
+  if (usb_devh == NULL) {
+    GST_DEBUG_OBJECT(self, "No libusb handle; cannot port-reset a silent device");
+    return FALSE;
+  }
+
+  gint rc = libusb_reset_device(usb_devh);
+  if (rc != LIBUSB_SUCCESS && rc != LIBUSB_ERROR_NOT_FOUND) {
+    GST_WARNING_OBJECT(self, "USB port reset failed (%d); device is unreachable", rc);
+    return FALSE;
+  }
+
+  GST_INFO_OBJECT(self, "USB port reset issued on a silent-but-present device%s",
+                  rc == LIBUSB_ERROR_NOT_FOUND ? " (re-enumerated)" : "");
+
+  // A port reset re-enumerates the device, and the reopen must not race that.
+  // MEASURED: reopening ~1 s after the reset reliably succeeds (uvc_open() and
+  // uvc_start_streaming() both return OK) and then delivers no frames at all,
+  // which is indistinguishable from the wedge just cleared. Wait in the same
+  // interruptible steps as the reconnect backoff, so a flush still tears down
+  // promptly.
+  for (guint slept_ms = 0; slept_ms < RESET_SETTLE_MS; slept_ms += 100) {
+    if (g_atomic_int_get(&self->flushing)) {
+      return FALSE;
+    }
+    g_usleep(100 * 1000);
+  }
+  return TRUE;
 }
 
 static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf) {
@@ -1037,7 +1228,14 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
       // mode (it just goes silent, per the Task 4 spike), so sustained silence
       // is how a disconnect is detected. Count consecutive timeouts; a single
       // gap is tolerated, but DISCONNECT_TIMEOUT_COUNT in a row means the device
-      // is gone.
+      // is gone. A device that delivered frames which produced no buffer
+      // (warmup-frames drops them) is not silent.
+      gint deliveries = g_atomic_int_get(&self->deliveries);
+      if (deliveries != self->deliveries_seen) {
+        self->deliveries_seen = deliveries;
+        self->consecutive_timeouts = 0;
+        continue;
+      }
       if (++self->consecutive_timeouts < DISCONNECT_TIMEOUT_COUNT) {
         continue;
       }
@@ -1047,9 +1245,30 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
 
       // Opt-in reconnect: try to resume before erroring. Default off, so a
       // disconnect always surfaces as a RESOURCE/READ error downstream.
-      if (self->reconnect_enabled && gst_libuvc_h264_src_reconnect(self)) {
-        self->consecutive_timeouts = 0;
-        continue;
+      if (self->reconnect_enabled) {
+        if (gst_libuvc_h264_src_reconnect(self)) {
+          self->consecutive_timeouts = 0;
+          continue;
+        }
+      } else if (!self->reset_recovery_used) {
+        // Sustained silence has TWO indistinguishable causes from here: the
+        // device was unplugged, or it is still present but WEDGED (see
+        // gst_libuvc_h264_src_reset_silent_device). With reconnect off we still
+        // owe the wedged case ONE port reset plus a single reopen, because
+        // "the device was removed" is factually wrong for a device that is still
+        // on the bus, and a reset is the only thing that recovers it. A
+        // genuinely absent device fails the reset, so this costs an unplugged
+        // device nothing and cannot mask a real disconnect. Deliberately ONE
+        // reopen, not the opt-in path's full retry ladder: `reconnect` stays the
+        // property that buys the ladder.
+        self->reset_recovery_used = TRUE;
+        self->frames_since_reset = 0;
+        if (gst_libuvc_h264_src_reset_silent_device(self) &&
+            gst_libuvc_h264_src_reconnect_bounded(self, 1)) {
+          GST_INFO_OBJECT(self, "Recovered a wedged device via USB port reset");
+          self->consecutive_timeouts = 0;
+          continue;
+        }
       }
 
       // A flush raced in during the reconnect backoff: honour it over the error.
@@ -1068,7 +1287,14 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
       continue;
     }
 
-    // A real frame arrived: silence is broken.
+    // A real frame arrived: silence is broken. Re-arm the one-shot reset only
+    // once the device has PROVEN it recovered, so a LATER wedge is recoverable
+    // (without this the recovery would fire at most once per session) but a
+    // device that emits one frame and re-wedges cannot reset the port forever.
+    if (self->reset_recovery_used
+        && ++self->frames_since_reset >= RESET_RECOVERY_REARM_FRAMES) {
+      self->reset_recovery_used = FALSE;
+    }
     self->consecutive_timeouts = 0;
     *buf = item;
     return GST_FLOW_OK;

@@ -1,0 +1,138 @@
+From 7b552ff3bcf9da9bca54861601f7b7e0f2183e10 Mon Sep 17 00:00:00 2001
+From: Andres Cera <Andres.cera@hotmail.com>
+Date: Fri, 3 Jul 2026 12:43:48 -0500
+Subject: [PATCH] fix(device,init): quarantine uvc_context on stop-timeout to
+ avoid handler-thread/libusb_exit UAF
+
+Rounds 1/2 quarantine the stream handle (strmh) and device handle (devh)
+when uvc_stream_stop()'s bounded wait times out with libusb transfers
+still outstanding, so a late _uvc_stream_callback() lands on live memory.
+But that quarantine branch of uvc_close() returns WITHOUT the normal last-
+device kill_handler_thread + pthread_join() (joining a wedged event thread
+would reintroduce the unbounded hang the bounded wait removed), so
+_uvc_handle_events() keeps looping on ctx->usb_ctx afterward. Two hazards
+followed: uvc_exit() unconditionally libusb_exit(usb_ctx)+free(ctx) out
+from under that live thread (UAF/race on the libusb context, every plugin
+stop() after a quarantine); and uvc_open_internal() spawns a handler thread
+whenever open_devices==NULL, which the quarantine emptied, so a reconnect
+reopening on the same context would start a SECOND _uvc_handle_events loop.
+
+Add has_quarantined_device to struct uvc_context. uvc_close()'s quarantine
+branch sets it; uvc_exit() then leaks the context (skips libusb_exit+free),
+mirroring the strmh/devh leaks so the running handler thread only reads
+live, never-freed memory; uvc_open_internal()'s spawn guard gains
+'&& !has_quarantined_device' so a reconnect never starts a duplicate thread
+(the surviving first thread services the whole libusb context, which is
+per-context not per-device). Never cleared: once any device on a context is
+quarantined a leaked outstanding transfer may still reference usb_ctx, so
+the context can never be safely torn down. Bounded-wait preserved; the
+normal path still fully frees devh then the context (no leak).
+
+Verified with a fork-level ASan/LSan harness driving the real uvc_exit()
+and _uvc_handle_events on a quarantined context (uvc_exit leaks ctx, no
+duplicate handler thread, normal path LSan-clean); a revert-check against
+ceralive-v0.0.7.5 reproduces the heap-use-after-free in _uvc_handle_events
+freed by uvc_exit, proving the test is non-vacuous.
+
+Tag: ceralive-v0.0.7.6
+
+(cherry picked from commit 3ede00e0a432beb175792f88b6b7e552bbdc2487)
+---
+ include/libuvc/libuvc_internal.h | 16 ++++++++++++++++
+ src/device.c                     | 21 +++++++++++++++++++--
+ src/init.c                       | 16 ++++++++++++++++
+ 3 files changed, 51 insertions(+), 2 deletions(-)
+
+diff --git a/include/libuvc/libuvc_internal.h b/include/libuvc/libuvc_internal.h
+index 648a4f9..6c98854 100644
+--- a/include/libuvc/libuvc_internal.h
++++ b/include/libuvc/libuvc_internal.h
+@@ -326,6 +326,22 @@ struct uvc_context {
+   uvc_device_handle_t *open_devices;
+   pthread_t handler_thread;
+   int kill_handler_thread;
++  /** Set once uvc_close() had to QUARANTINE a device handle on this context
++   * because uvc_stream_stop()'s bounded wait timed out with libusb transfers
++   * still outstanding (a dead/unplugged device whose cancelled transfers never
++   * completed). The quarantine branch of uvc_close() unlinks the device but
++   * deliberately does NOT set kill_handler_thread / pthread_join the event
++   * handler (that would risk the unbounded hang the bounded wait removed), so
++   * _uvc_handle_events() may still be looping on usb_ctx. While this flag is
++   * set, uvc_exit() must NOT libusb_exit(usb_ctx) or free(ctx): the running
++   * handler thread dereferences both every iteration -- freeing them is a
++   * use-after-free / race on the libusb context itself. It also gates
++   * uvc_open_internal() so a reconnect that reopens a device on this context
++   * never spawns a SECOND handler thread (the first, from the quarantined
++   * close, was never killed and keeps servicing the whole libusb context,
++   * including any newly-opened device). Intentionally leak ctx + usb_ctx,
++   * mirroring the strmh/devh quarantine leaks. Never cleared. */
++  uint8_t has_quarantined_device;
+ };
+ 
+ uvc_error_t uvc_query_stream_ctrl(
+diff --git a/src/device.c b/src/device.c
+index 750f583..4fa8cc1 100644
+--- a/src/device.c
++++ b/src/device.c
+@@ -393,8 +393,17 @@ static uvc_error_t uvc_open_internal(
+     }
+   }
+ 
+-  if (dev->ctx->own_usb_ctx && dev->ctx->open_devices == NULL) {
+-    /* Since this is our first device, we need to spawn the event handler thread */
++  if (dev->ctx->own_usb_ctx && dev->ctx->open_devices == NULL
++      && !dev->ctx->has_quarantined_device) {
++    /* Since this is our first device, we need to spawn the event handler thread.
++     * context-lifetime hotfix (round 3): but NOT if this context has a
++     * quarantined device -- open_devices was emptied when uvc_close() unlinked
++     * that quarantined handle, yet its event handler thread was intentionally
++     * never killed and is still looping on ctx->usb_ctx. Spawning here would run
++     * a SECOND thread calling libusb_handle_events_completed() on the same
++     * libusb context (a reconnect after a dead-device disconnect hits exactly
++     * this). The surviving first thread already services the whole context,
++     * including this newly-opened device, so reopening needs no new thread. */
+     uvc_start_handler_thread(dev->ctx);
+   }
+ 
+@@ -1776,6 +1785,14 @@ void uvc_close(uvc_device_handle_t *devh) {
+               "(intentional bounded leak) to avoid a use-after-free on a late "
+               "transfer completion that dereferences devh", (void *) devh);
+     DL_DELETE(ctx->open_devices, devh);
++    /* context-lifetime hotfix (round 3): this quarantine path returns WITHOUT
++     * killing/joining the event handler thread (doing so could hang on a wedged
++     * dead device), so _uvc_handle_events() may still be looping on ctx->usb_ctx.
++     * Propagate the quarantine to the context so uvc_exit() will not
++     * libusb_exit()/free() it out from under that thread, and so a reconnect's
++     * uvc_open_internal() on this same context does not spawn a duplicate
++     * handler thread. */
++    ctx->has_quarantined_device = 1;
+     UVC_EXIT_VOID();
+     return;
+   }
+diff --git a/src/init.c b/src/init.c
+index 4802835..f376039 100644
+--- a/src/init.c
++++ b/src/init.c
+@@ -142,6 +142,22 @@ void uvc_exit(uvc_context_t *ctx) {
+     uvc_close(devh);
+   }
+ 
++  /* context-lifetime hotfix (round 3): a quarantined uvc_close() (a dead device
++   * whose cancelled transfers never completed within the bounded stop wait)
++   * returns without killing/joining the event handler thread, so
++   * _uvc_handle_events() may still be looping on ctx->usb_ctx. Tearing the
++   * context down here -- libusb_exit(usb_ctx) then free(ctx) -- would pull both
++   * out from under that live thread: a use-after-free / race on the libusb
++   * context. Intentionally leak ctx (and usb_ctx) instead, mirroring the
++   * strmh/devh quarantine leaks. Bounded: uvc_exit() still returns immediately;
++   * the leaked thread keeps servicing a valid, never-freed context. */
++  if (ctx->has_quarantined_device) {
++    UVC_DEBUG("context %p has a quarantined device handle; leaking the context "
++              "(skipping libusb_exit + free) so the still-running event handler "
++              "thread never dereferences a freed libusb context", (void *) ctx);
++    return;
++  }
++
+   if (ctx->own_usb_ctx)
+     libusb_exit(ctx->usb_ctx);
+ 
