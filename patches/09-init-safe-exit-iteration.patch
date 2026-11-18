@@ -1,0 +1,52 @@
+From ad414a4596f7242a3f883eb075e1b1309a84f8c1 Mon Sep 17 00:00:00 2001
+From: Andres Cera <Andres.cera@hotmail.com>
+Date: Fri, 3 Jul 2026 13:52:49 -0500
+Subject: [PATCH] fix(init): safe iteration in uvc_exit over open_devices to
+ avoid use-after-free
+
+uvc_exit() walked ctx->open_devices with a plain DL_FOREACH, which reads
+el->next in its increment step AFTER the loop body. uvc_close(), on its
+normal (non-quarantine) path, DL_DELETEs devh and uvc_free_devh(devh)s it,
+so the next iteration's el->next read is on freed memory -- a use-after-free
+reproducible whenever uvc_exit() runs with two or more devices open on the
+same context (with or without a quarantine involved).
+
+Iterate with DL_FOREACH_SAFE, caching next before the body runs, mirroring
+uvc_stop_streaming()'s existing DL_FOREACH_SAFE over devh->streams. Only the
+iteration macro changes; the round-3 quarantine guard after the loop is
+unchanged. Sweep confirmed init.c:141 was the only DL_FOREACH whose body
+frees the iterated element.
+
+Tag ceralive-v0.0.7.8.
+
+(cherry picked from commit 71588dbc23c5204e07c575c3b2ae6ac7ee9bf90d)
+---
+ src/init.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/src/init.c b/src/init.c
+index f376039..4cc7592 100644
+--- a/src/init.c
++++ b/src/init.c
+@@ -136,9 +136,19 @@ uvc_error_t uvc_init(uvc_context_t **pctx, struct libusb_context *usb_ctx) {
+  * @param ctx UVC context to shut down
+  */
+ void uvc_exit(uvc_context_t *ctx) {
+-  uvc_device_handle_t *devh;
++  uvc_device_handle_t *devh, *devh_tmp;
+ 
+-  DL_FOREACH(ctx->open_devices, devh) {
++  /* lifetime hotfix (round 5): uvc_close(devh), on its NORMAL (non-quarantine)
++   * path, DL_DELETEs devh from ctx->open_devices and then uvc_free_devh(devh)s
++   * it. A plain DL_FOREACH reads el->next in its increment step AFTER the body
++   * runs, so once uvc_close() has freed the current node the next iteration
++   * dereferences freed memory -- a use-after-free reproducible whenever two or
++   * more devices are open on the same context (e.g. one quarantined handle plus
++   * one live normally-open device). Iterate with DL_FOREACH_SAFE, which caches
++   * next in devh_tmp BEFORE the body runs, mirroring uvc_stop_streaming()'s
++   * DL_FOREACH_SAFE over devh->streams (uvc_stream_close() frees strmh the same
++   * way). */
++  DL_FOREACH_SAFE(ctx->open_devices, devh, devh_tmp) {
+     uvc_close(devh);
+   }
+ 

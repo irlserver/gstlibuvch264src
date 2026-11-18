@@ -1,0 +1,69 @@
+From b1f5a6306a32c51a0a1a8f92d00464366ce16fdd Mon Sep 17 00:00:00 2001
+From: Andres Cera <Andres.cera@hotmail.com>
+Date: Fri, 3 Jul 2026 13:14:35 -0500
+Subject: [PATCH] fix(device): gate last-device handler-thread kill/join on
+ quarantine state
+
+Once a uvc_context has quarantined a device (has_quarantined_device set by the
+round-3 stop-timeout path, and deliberately never cleared), the surviving
+per-context _uvc_handle_events() thread is intentionally kept alive. But
+uvc_close()'s NORMAL last-device branch still unconditionally set
+kill_handler_thread=1 and pthread_join(ctx->handler_thread). After a quarantine
+on device A, a reconnect can reopen device B on the same context (round 3
+correctly spawns no duplicate handler thread); a subsequent NORMAL close of B
+(e.g. negotiation/stream-start failed before streaming, so B never quarantined)
+saw B as the only/last open device and killed+joined the survivor. Because
+has_quarantined_device is never cleared, uvc_open_internal()'s spawn guard then
+never starts a replacement -> all future event servicing on that context dies
+silently. Reachable from the plugin's gst_libuvc_h264_src_reconnect() path.
+
+Gate the branch with '&& !ctx->has_quarantined_device': once quarantined,
+uvc_close() takes the else branch, still libusb_close()-ing the closing device's
+own USB handle but never touching the shared handler thread's lifetime. Normal
+(never-quarantined) contexts are byte-identical to before. This is the last
+ungated kill_handler_thread / pthread_join(ctx->handler_thread) site.
+
+Bounded-wait guarantee preserved. Verified with the round-3 ASan/LSan harness
+extended with a T7 scenario (quarantine A, reopen B, normal-close B, assert the
+survivor thread stays alive/servicing); revert-check vs ceralive-v0.0.7.6
+reproduces the kill (non-vacuous).
+
+(cherry picked from commit 2dcca597e1534456273323a268d0fd98016e4aa8)
+---
+ src/device.c | 23 +++++++++++++++++++++--
+ 1 file changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/src/device.c b/src/device.c
+index 4fa8cc1..3e93d74 100644
+--- a/src/device.c
++++ b/src/device.c
+@@ -1802,8 +1802,27 @@ void uvc_close(uvc_device_handle_t *devh) {
+   /* If we are managing the libusb context and this is the last open device,
+    * then we need to cancel the handler thread. When we call libusb_close,
+    * it'll cause a return from the thread's libusb_handle_events call, after
+-   * which the handler thread will check the flag we set and then exit. */
+-  if (ctx->own_usb_ctx && ctx->open_devices == devh && devh->next == NULL) {
++   * which the handler thread will check the flag we set and then exit.
++   *
++   * context-lifetime hotfix (round 4): but NOT if this context has ever
++   * quarantined a device. Once has_quarantined_device is set, an earlier
++   * uvc_close() intentionally kept the event handler thread alive (killing/
++   * joining a wedged dead device would reintroduce the unbounded hang the
++   * bounded stop wait removed) and left the flag set forever (a leaked
++   * outstanding transfer may still reference ctx->usb_ctx). A later NORMAL
++   * close of another device reopened on this same context (e.g. a reconnect
++   * whose negotiation or stream-start failed before any streaming, so this
++   * handle never quarantined) would otherwise TRUE-branch here -- it is the
++   * only/last open device -- and kill+join that surviving handler thread. That
++   * both risks joining a possibly-wedged thread and, worse, leaves
++   * has_quarantined_device == 1 with the thread dead: uvc_open_internal()'s
++   * spawn guard (also gated on !has_quarantined_device) then never starts a
++   * replacement, silently killing all future event servicing on the context.
++   * So once quarantined, uvc_close() must never again touch the shared handler
++   * thread's lifetime -- take the else branch, releasing only THIS device's own
++   * USB handle. */
++  if (ctx->own_usb_ctx && ctx->open_devices == devh && devh->next == NULL
++      && !ctx->has_quarantined_device) {
+     ctx->kill_handler_thread = 1;
+     libusb_close(devh->usb_devh);
+     pthread_join(ctx->handler_thread, NULL);

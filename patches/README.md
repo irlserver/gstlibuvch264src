@@ -43,6 +43,23 @@ interface with no altsetting. The patch rejects both with
 descriptor. It must follow `01-uvc15-support.patch`, which changes the
 surrounding lines in `src/device.c`.
 
+## 04 to 09: stopping a stream on a dead device
+
+From CeraLive's libuvc fork (`ab49e21`, `dfba86f`, `a1949ae`, `3ede00e`,
+`2dcca59`, `71588db`, each with its commit message and a cherry-pick line).
+
+- `04-stream-bounded-stop.patch`: `uvc_stream_stop()` waits for the
+  cancelled transfers of a dead or unplugged device for at most 5 seconds,
+  then returns `UVC_ERROR_TIMEOUT`, instead of hanging the caller.
+- `05` to `08`: when that wait times out, transfers can still complete
+  later and touch the stream handle, the device handle and the context.
+  Closing then keeps those three allocated (a deliberate leak) instead of
+  freeing memory a late callback still uses, and does not kill or join the
+  handler thread under them.
+- `09-init-safe-exit-iteration.patch`: `uvc_exit()` closes each open device
+  while iterating over the list that closing removes it from. It now uses
+  a safe iteration.
+
 ## Apply (host build)
 
 ```sh
