@@ -40,8 +40,7 @@ RUN git init -q . && \
 	git remote add origin https://github.com/libuvc/libuvc.git && \
 	git fetch --depth 1 origin 68d07a00e11d1944e27b7295ee69673239c00b4b && \
 	git checkout -q FETCH_HEAD && \
-	patch -p1 < /app/patches/uvc15-support.patch && \
-	patch -p1 < /app/patches/libuvc-h265-support.patch && \
+	sh /app/patches/apply.sh && \
 	cmake . \
 		-DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
 		-DCMAKE_BUILD_TYPE=Release \
