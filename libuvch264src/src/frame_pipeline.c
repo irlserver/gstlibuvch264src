@@ -279,6 +279,11 @@ void frame_callback(uvc_frame_t *frame, void *ptr) {
         return;
     }
 
+    /* Proof of life for the silence watchdog in create(), which otherwise only
+       sees queued buffers: warmup drops and parameter-set-only deliveries
+       queue nothing from a camera that is working. */
+    g_atomic_int_inc(&self->deliveries);
+
     unsigned char* data = frame->data;
     gsize data_bytes = frame->data_bytes;
     gboolean updated_sps_pps = FALSE;

@@ -37,6 +37,11 @@ struct _GstLibuvcH264Src {
    * create() infers a disconnect after DISCONNECT_TIMEOUT_COUNT consecutive 1s
    * timeouts. Reset in start() and whenever a real frame arrives. */
   gint consecutive_timeouts;
+  /* atomic: frames libuvc delivered, counted by frame_callback() whether or not
+   * they produced a buffer. create() compares it with deliveries_seen (its own,
+   * streaming thread only) before counting a pop timeout as silence. */
+  gint deliveries;
+  gint deliveries_seen;
   /* One-shot USB port-reset recovery for a WEDGED device: enumerated, answering
    * every control transfer, yet delivering no payload on the streaming endpoint.
    * Close/reopen and a kernel-driver reattach both leave it wedged; only a port

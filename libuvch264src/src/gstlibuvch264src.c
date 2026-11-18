@@ -1228,7 +1228,14 @@ static GstFlowReturn gst_libuvc_h264_src_create(GstPushSrc *src, GstBuffer **buf
       // mode (it just goes silent, per the Task 4 spike), so sustained silence
       // is how a disconnect is detected. Count consecutive timeouts; a single
       // gap is tolerated, but DISCONNECT_TIMEOUT_COUNT in a row means the device
-      // is gone.
+      // is gone. A device that delivered frames which produced no buffer
+      // (warmup-frames drops them) is not silent.
+      gint deliveries = g_atomic_int_get(&self->deliveries);
+      if (deliveries != self->deliveries_seen) {
+        self->deliveries_seen = deliveries;
+        self->consecutive_timeouts = 0;
+        continue;
+      }
       if (++self->consecutive_timeouts < DISCONNECT_TIMEOUT_COUNT) {
         continue;
       }
